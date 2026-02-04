@@ -109,7 +109,7 @@ func (m *AuthManager) refreshAllUsageCache() {
 			continue
 		}
 
-		usage, err := m.GetUsageLimitsWithToken(acc.Token.AccessToken, acc.Token.Region)
+		usage, err := m.GetUsageLimitsWithToken(acc.Token.AccessToken, acc.Token.Region, acc.ProfileArn)
 		if err != nil {
 			fmt.Printf("[额度缓存] 账号 %s 获取失败: %v\n", acc.ID[:8], err)
 			continue
@@ -840,6 +840,110 @@ func generateMachineID() string {
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
+// ListAvailableProfiles 调用 AWS API 获取当前账号可用的 Profile 列表
+// 返回第一个 Profile 的 ARN（通常每个账号只有一个 Profile）
+func (m *AuthManager) ListAvailableProfiles(accessToken, region string) (string, error) {
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	url := fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/ListAvailableProfiles", region)
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return "", fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API 请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result struct {
+		Profiles []struct {
+			Arn  string `json:"arn"`
+			Name string `json:"name"`
+		} `json:"profiles"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("解析响应失败: %w", err)
+	}
+
+	if len(result.Profiles) == 0 {
+		return "", fmt.Errorf("没有可用的 Profile")
+	}
+
+	return result.Profiles[0].Arn, nil
+}
+
+// InitAllProfileArns 初始化所有账号的 profileArn
+// 遍历所有账号，如果 profileArn 为空则调用 API 获取
+func (m *AuthManager) InitAllProfileArns() (int, int, error) {
+	config, err := m.LoadAccountsConfig()
+	if err != nil {
+		return 0, 0, fmt.Errorf("加载账号配置失败: %w", err)
+	}
+
+	if len(config.Accounts) == 0 {
+		return 0, 0, nil
+	}
+
+	successCount := 0
+	failCount := 0
+	updated := false
+
+	for i := range config.Accounts {
+		acc := &config.Accounts[i]
+
+		// 跳过已有 profileArn 的账号
+		if acc.ProfileArn != "" {
+			continue
+		}
+
+		// 跳过无 Token 的账号
+		if acc.Token == nil || acc.Token.AccessToken == "" {
+			failCount++
+			continue
+		}
+
+		// 获取 profileArn
+		region := acc.Token.Region
+		if region == "" {
+			region = "us-east-1"
+		}
+
+		profileArn, err := m.ListAvailableProfiles(acc.Token.AccessToken, region)
+		if err != nil {
+			fmt.Printf("[初始化] 账号 %s 获取 profileArn 失败: %v\n", acc.ID, err)
+			failCount++
+			continue
+		}
+
+		acc.ProfileArn = profileArn
+		updated = true
+		successCount++
+		fmt.Printf("[初始化] 账号 %s profileArn: %s\n", acc.ID, profileArn)
+	}
+
+	// 保存更新后的配置
+	if updated {
+		if err := m.SaveAccountsConfig(config); err != nil {
+			return successCount, failCount, fmt.Errorf("保存配置失败: %w", err)
+		}
+	}
+
+	return successCount, failCount, nil
+}
+
 // GetProfileArn 获取 Profile ARN
 // 优先从账号配置读取（服务器部署），降级到本地 Kiro IDE 文件（本地开发）
 func (m *AuthManager) GetProfileArn() (string, error) {
@@ -877,6 +981,7 @@ func (m *AuthManager) GetProfileArn() (string, error) {
 }
 
 // GetUsageLimits 获取额度使用情况
+// 注意：此功能依赖 profileArn，服务器部署时可能无法获取，会返回 nil
 func (m *AuthManager) GetUsageLimits() (*UsageLimitsResponse, error) {
 	// 获取有效的 Access Token
 	accessToken, err := m.GetAccessToken()
@@ -884,10 +989,11 @@ func (m *AuthManager) GetUsageLimits() (*UsageLimitsResponse, error) {
 		return nil, fmt.Errorf("获取 access token 失败: %w", err)
 	}
 
-	// 获取 Profile ARN
+	// 获取 Profile ARN（服务器部署时可能失败，优雅降级）
 	profileArn, err := m.GetProfileArn()
-	if err != nil {
-		return nil, fmt.Errorf("获取 profile ARN 失败: %w", err)
+	if err != nil || profileArn == "" {
+		// profileArn 不可用，返回空响应而不是错误
+		return nil, nil
 	}
 
 	// 获取区域
@@ -932,16 +1038,18 @@ func (m *AuthManager) GetUsageLimits() (*UsageLimitsResponse, error) {
 	return &usageResp, nil
 }
 
-// GetUsageLimitsWithToken 使用指定 Token 获取额度（用于多账号场景）
-func (m *AuthManager) GetUsageLimitsWithToken(accessToken, region string) (*UsageLimitsResponse, error) {
+// GetUsageLimitsWithToken 使用指定 Token 和 profileArn 获取额度（用于多账号场景）
+func (m *AuthManager) GetUsageLimitsWithToken(accessToken, region, profileArn string) (*UsageLimitsResponse, error) {
 	if region == "" {
 		region = "us-east-1"
 	}
 
-	// 尝试从本地文件获取 profileArn（所有账号共用同一个 profile）
-	profileArn, _ := m.GetProfileArn()
+	// profileArn 为空时，尝试从本地文件获取（兼容本地开发）
 	if profileArn == "" {
-		return nil, fmt.Errorf("无法获取 profileArn")
+		profileArn, _ = m.GetProfileArn()
+	}
+	if profileArn == "" {
+		return nil, fmt.Errorf("profileArn 不可用")
 	}
 
 	// isEmailRequired=true 让 API 返回用户邮箱
@@ -1359,11 +1467,22 @@ func (m *AuthManager) CompleteLogin(session *LoginSession) (*AccountInfo, error)
 	m.clientReg = nil
 	m.mu.Unlock()
 
-	// 获取用户信息（userId）
-	usage, err := m.GetUsageLimits()
-	if err == nil && usage != nil {
-		account.UserId = usage.UserInfo.UserId
-		account.Email = usage.UserInfo.Email
+	// 获取 profileArn（登录后自动获取）
+	profileArn, err := m.ListAvailableProfiles(token.AccessToken, session.Region)
+	if err != nil {
+		fmt.Printf("[登录] 获取 profileArn 失败: %v\n", err)
+	} else {
+		account.ProfileArn = profileArn
+		fmt.Printf("[登录] 获取 profileArn 成功: %s\n", profileArn)
+	}
+
+	// 获取用户信息（userId）- 需要 profileArn
+	if account.ProfileArn != "" {
+		usage, err := m.GetUsageLimitsWithToken(token.AccessToken, session.Region, account.ProfileArn)
+		if err == nil && usage != nil {
+			account.UserId = usage.UserInfo.UserId
+			account.Email = usage.UserInfo.Email
+		}
 	}
 
 	// 加载现有账号配置
@@ -1538,8 +1657,8 @@ func (m *AuthManager) RefreshAccountToken(accountID string) error {
 	}
 
 	// 刷新成功后，尝试更新该账号的额度缓存
-	go func(accID, accessToken, region string) {
-		usage, err := m.GetUsageLimitsWithToken(accessToken, region)
+	go func(accID, accessToken, region, profileArn string) {
+		usage, err := m.GetUsageLimitsWithToken(accessToken, region, profileArn)
 		if err != nil {
 			return
 		}
@@ -1549,7 +1668,7 @@ func (m *AuthManager) RefreshAccountToken(accountID string) error {
 				break
 			}
 		}
-	}(accountID, refreshResp.AccessToken, region)
+	}(accountID, refreshResp.AccessToken, region, targetAccount.ProfileArn)
 
 	return nil
 }
@@ -1622,8 +1741,8 @@ func (m *AuthManager) RefreshAllAccounts() {
 		// 检查是否即将过期（30分钟内）
 		if !m.isTokenExpiringSoon(acc.Token, 30*time.Minute) {
 			// Token 未过期，但仍然更新额度缓存（异步）
-			go func(accID, accessToken, region string) {
-				usage, err := m.GetUsageLimitsWithToken(accessToken, region)
+			go func(accID, accessToken, region, profileArn string) {
+				usage, err := m.GetUsageLimitsWithToken(accessToken, region, profileArn)
 				if err != nil {
 					return
 				}
@@ -1633,7 +1752,7 @@ func (m *AuthManager) RefreshAllAccounts() {
 						break
 					}
 				}
-			}(acc.ID, acc.Token.AccessToken, acc.Token.Region)
+			}(acc.ID, acc.Token.AccessToken, acc.Token.Region, acc.ProfileArn)
 			continue
 		}
 
@@ -1723,15 +1842,26 @@ func (m *AuthManager) ImportAccount(tokenJSON, clientRegJSON string) (*AccountIn
 		os.WriteFile(clientRegPath, clientRegData, 0600)
 	}
 
-	// 尝试获取用户信息
+	// 获取 profileArn（导入时自动获取）
 	region := token.Region
 	if region == "" {
 		region = "us-east-1"
 	}
-	usage, err := m.GetUsageLimitsWithToken(token.AccessToken, region)
-	if err == nil && usage != nil {
-		account.UserId = usage.UserInfo.UserId
-		account.Email = usage.UserInfo.Email
+	profileArn, err := m.ListAvailableProfiles(token.AccessToken, region)
+	if err != nil {
+		fmt.Printf("[导入] 获取 profileArn 失败: %v\n", err)
+	} else {
+		account.ProfileArn = profileArn
+		fmt.Printf("[导入] 获取 profileArn 成功: %s\n", profileArn)
+	}
+
+	// 尝试获取用户信息（需要 profileArn）
+	if account.ProfileArn != "" {
+		usage, err := m.GetUsageLimitsWithToken(token.AccessToken, region, account.ProfileArn)
+		if err == nil && usage != nil {
+			account.UserId = usage.UserInfo.UserId
+			account.Email = usage.UserInfo.Email
+		}
 	}
 
 	// 加载现有账号配置

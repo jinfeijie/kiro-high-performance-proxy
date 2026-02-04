@@ -444,10 +444,10 @@ func main() {
 		api.GET("/auth/poll/:sessionId", handlePollLogin)
 		api.POST("/auth/import", handleImportAccount)
 		api.GET("/accounts", handleListAccounts)
+		api.POST("/accounts/refresh-all", handleRefreshAllAccounts)
 		api.DELETE("/accounts/:id", handleDeleteAccount)
 		api.POST("/accounts/:id/refresh", handleRefreshAccount)
 		api.GET("/accounts/:id/detail", handleAccountDetail)
-		api.POST("/accounts/refresh-all", handleRefreshAllAccounts)
 
 		// API-KEY 管理
 		api.GET("/settings/api-keys", handleGetApiKeys)
@@ -1354,9 +1354,9 @@ func handleListAccounts(c *gin.Context) {
 			}
 		}
 
-		// 尝试获取该账号的额度（使用账号的 Token）
+		// 尝试获取该账号的额度（使用账号的 Token 和 ProfileArn）
 		if acc.Token != nil && acc.Token.AccessToken != "" {
-			usage, err := client.Auth.GetUsageLimitsWithToken(acc.Token.AccessToken, acc.Token.Region)
+			usage, err := client.Auth.GetUsageLimitsWithToken(acc.Token.AccessToken, acc.Token.Region, acc.ProfileArn)
 			if err != nil {
 				fmt.Printf("[账号 %s] 获取额度失败: %v\n", acc.ID, err)
 			} else if len(usage.UsageBreakdownList) > 0 {
@@ -1520,7 +1520,7 @@ func handleAccountDetail(c *gin.Context) {
 		}
 
 		// 获取额度信息
-		usage, err := client.Auth.GetUsageLimitsWithToken(account.Token.AccessToken, account.Token.Region)
+		usage, err := client.Auth.GetUsageLimitsWithToken(account.Token.AccessToken, account.Token.Region, account.ProfileArn)
 		if err == nil && usage != nil {
 			// 订阅信息
 			subName := usage.SubscriptionInfo.SubscriptionTitle
