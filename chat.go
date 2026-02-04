@@ -367,10 +367,6 @@ func (s *ChatService) ChatStream(messages []ChatMessage, callback func(content s
 
 // ChatWithModel 非流式聊天（支持指定模型）
 func (s *ChatService) ChatWithModel(messages []ChatMessage, model string) (string, error) {
-	// 打印请求日志
-	if data, err := json.Marshal(messages); err == nil {
-		fmt.Println(string(data))
-	}
 	var result strings.Builder
 
 	err := s.ChatStreamWithModel(messages, model, func(content string, done bool) {
