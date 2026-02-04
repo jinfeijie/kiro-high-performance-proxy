@@ -124,6 +124,11 @@ var modelMappingFile = "model-mapping.json"
 var apiKeysFile = "api-keys.json"
 var apiKeys []string // API-KEY 列表（支持 Claude X-API-Key 和 OpenAI Bearer Token）
 
+// ========== IP 黑名单 ==========
+var ipBlacklistFile = "ip-blacklist.json"
+var ipBlacklist []string
+var ipBlacklistMutex sync.RWMutex
+
 // ========== 全局 Token 统计 ==========
 var tokenStatsFile = "token-stats.json"
 var tokenStats TokenStats
@@ -243,6 +248,115 @@ func saveApiKeys() error {
 		return err
 	}
 	return os.WriteFile(apiKeysFile, data, 0644)
+}
+
+// loadIpBlacklist 从文件加载 IP 黑名单
+func loadIpBlacklist() {
+	data, err := os.ReadFile(ipBlacklistFile)
+	if err != nil {
+		ipBlacklist = []string{}
+		return
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err != nil {
+		ipBlacklist = []string{}
+		return
+	}
+	ipBlacklist = list
+	fmt.Printf("🚫 已加载 %d 个黑名单 IP\n", len(ipBlacklist))
+}
+
+// saveIpBlacklist 保存 IP 黑名单到文件
+func saveIpBlacklist() error {
+	data, err := json.MarshalIndent(ipBlacklist, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(ipBlacklistFile, data, 0644)
+}
+
+// ipBlacklistMiddleware IP 黑名单中间件
+func ipBlacklistMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		clientIP := c.ClientIP()
+
+		ipBlacklistMutex.RLock()
+		blocked := false
+		for _, ip := range ipBlacklist {
+			if ip == clientIP {
+				blocked = true
+				break
+			}
+		}
+		ipBlacklistMutex.RUnlock()
+
+		if blocked {
+			c.JSON(403, gin.H{
+				"error": map[string]any{
+					"message": "IP blocked",
+					"type":    "forbidden",
+				},
+			})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// handleGetIpBlacklist 获取 IP 黑名单
+func handleGetIpBlacklist(c *gin.Context) {
+	ipBlacklistMutex.RLock()
+	list := make([]string, len(ipBlacklist))
+	copy(list, ipBlacklist)
+	data, _ := json.Marshal(ipBlacklist)
+	hash := computeHash(data)
+	ipBlacklistMutex.RUnlock()
+
+	c.JSON(200, gin.H{"ips": list, "count": len(list), "hash": hash})
+}
+
+// handleUpdateIpBlacklist 更新 IP 黑名单
+func handleUpdateIpBlacklist(c *gin.Context) {
+	var req struct {
+		IPs  []string `json:"ips"`
+		Hash string   `json:"hash"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	ipBlacklistMutex.Lock()
+	defer ipBlacklistMutex.Unlock()
+
+	// 乐观锁校验
+	if req.Hash != "" {
+		currentData, _ := json.Marshal(ipBlacklist)
+		currentHash := computeHash(currentData)
+		if req.Hash != currentHash {
+			c.JSON(409, gin.H{"error": "配置已被修改，请刷新后重试"})
+			return
+		}
+	}
+
+	// 过滤空值
+	var validIPs []string
+	for _, ip := range req.IPs {
+		if ip != "" {
+			validIPs = append(validIPs, ip)
+		}
+	}
+
+	ipBlacklist = validIPs
+	if err := saveIpBlacklist(); err != nil {
+		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
+		return
+	}
+
+	newData, _ := json.Marshal(ipBlacklist)
+	newHash := computeHash(newData)
+	c.JSON(200, gin.H{"message": "IP 黑名单已更新", "count": len(ipBlacklist), "hash": newHash})
 }
 
 // apiKeyAuthMiddleware API-KEY 验证中间件
@@ -394,6 +508,9 @@ func main() {
 	// 加载 API-KEY 配置
 	loadApiKeys()
 
+	// 加载 IP 黑名单
+	loadIpBlacklist()
+
 	// 加载 Token 统计数据并启动后台写入协程
 	loadTokenStats()
 	go tokenStatsWorker()
@@ -418,6 +535,9 @@ func main() {
 		}
 		c.Next()
 	})
+
+	// IP 黑名单中间件（全局生效）
+	r.Use(ipBlacklistMiddleware())
 
 	// 静态文件服务 - 从项目根目录运行时的路径
 	r.Static("/static", "./server/static")
@@ -452,6 +572,10 @@ func main() {
 		// API-KEY 管理
 		api.GET("/settings/api-keys", handleGetApiKeys)
 		api.POST("/settings/api-keys", handleUpdateApiKeys)
+
+		// IP 黑名单管理
+		api.GET("/settings/ip-blacklist", handleGetIpBlacklist)
+		api.POST("/settings/ip-blacklist", handleUpdateIpBlacklist)
 
 		// Token 统计
 		api.GET("/stats", handleGetStats)
