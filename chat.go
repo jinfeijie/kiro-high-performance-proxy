@@ -9,8 +9,6 @@ import (
 	"hash/crc32"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -28,49 +26,16 @@ type ChatService struct {
 	httpClient  *http.Client
 	machineID   string
 	version     string
-	profileArn  string
 }
 
 // NewChatService 创建聊天服务
 func NewChatService(authManager *AuthManager) *ChatService {
-	service := &ChatService{
+	return &ChatService{
 		authManager: authManager,
 		httpClient:  &http.Client{Timeout: 120 * time.Second},
 		machineID:   generateMachineID(),
 		version:     "0.8.140",
 	}
-
-	// 读取 profileArn
-	if arn, err := service.readProfileArn(); err == nil {
-		service.profileArn = arn
-	}
-
-	return service
-}
-
-// readProfileArn 读取 profile ARN
-func (s *ChatService) readProfileArn() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-
-	profilePath := filepath.Join(homeDir, "Library", "Application Support", "Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json")
-
-	data, err := os.ReadFile(profilePath)
-	if err != nil {
-		return "", err
-	}
-
-	var profile struct {
-		Arn  string `json:"arn"`
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(data, &profile); err != nil {
-		return "", err
-	}
-
-	return profile.Arn, nil
 }
 
 // generateConversationID 生成会话 ID
@@ -96,17 +61,6 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 	// 打印使用的账号（用于调试轮询）
 	if accountID != "" {
 		fmt.Printf("[轮询] 使用账号: %s\n", accountID[:8])
-	}
-
-	// 获取 profileArn
-	profileArn := s.profileArn
-	if profileArn == "" {
-		if arn, err := s.readProfileArn(); err == nil {
-			profileArn = arn
-			s.profileArn = arn
-		} else {
-			return fmt.Errorf("获取 profileArn 失败: %w", err)
-		}
 	}
 
 	// 构建会话状态
@@ -181,7 +135,6 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 			"history":         history,
 			"chatTriggerType": "MANUAL",
 		},
-		"profileArn": profileArn,
 	}
 
 	// 添加 customizationArn（模型参数）

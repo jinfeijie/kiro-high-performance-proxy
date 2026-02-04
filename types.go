@@ -264,6 +264,7 @@ type AccountInfo struct {
 	ClientSecret string         `json:"clientSecret"` // OIDC 客户端密钥
 	UserId       string         `json:"userId"`       // 用户 ID
 	Email        string         `json:"email"`        // 用户邮箱
+	ProfileArn   string         `json:"profileArn"`   // Profile ARN（服务器部署必需）
 	CreatedAt    string         `json:"createdAt"`    // 创建时间
 	LastUsedAt   string         `json:"lastUsedAt"`   // 最后使用时间
 }

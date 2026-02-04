@@ -841,13 +841,25 @@ func generateMachineID() string {
 }
 
 // GetProfileArn 获取 Profile ARN
+// 优先从账号配置读取（服务器部署），降级到本地 Kiro IDE 文件（本地开发）
 func (m *AuthManager) GetProfileArn() (string, error) {
+	// 优先从账号配置读取（服务器部署场景）
+	config := m.getAccountsFromCache()
+	if config != nil && len(config.Accounts) > 0 {
+		for _, acc := range config.Accounts {
+			if acc.ProfileArn != "" {
+				return acc.ProfileArn, nil
+			}
+		}
+	}
+
+	// 降级：从本地 Kiro IDE 的 profile.json 读取（本地开发场景）
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("获取用户目录失败: %w", err)
 	}
 
-	// 读取 profile.json
+	// macOS 路径
 	profilePath := filepath.Join(homeDir, "Library", "Application Support", "Kiro", "User", "globalStorage", "kiro.kiroagent", "profile.json")
 	data, err := os.ReadFile(profilePath)
 	if err != nil {
