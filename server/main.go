@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 
 	kiroclient "github.com/jinfeijie/kiro-api-client-go"
@@ -403,6 +404,9 @@ func main() {
 
 	r := gin.Default()
 
+	// 注册 pprof 路由
+	pprof.Register(r)
+
 	// CORS
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -484,6 +488,7 @@ func main() {
 	fmt.Println("🔗 OpenAI 格式: POST /v1/chat/completions")
 	fmt.Println("🔗 Claude 格式: POST /v1/messages")
 	fmt.Println("🔗 Anthropic 格式: POST /anthropic/v1/messages")
+	fmt.Printf("🔧 pprof: http://localhost:%s/debug/pprof/\n", port)
 
 	r.Run(":" + port)
 }
