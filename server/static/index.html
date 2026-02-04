@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiro API Client - Web 控制台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .tab-button.active { background-color: #3b82f6 !important; color: white !important; }
+        .tab-button.active:hover { background-color: #2563eb !important; }
+        .message { animation: slideIn 0.3s ease-out; }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+        .loading { border: 3px solid #f3f3f3; border-top: 3px solid #3b82f6; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .account-card { transition: all 0.2s ease; cursor: pointer; }
+        .account-card:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(59,130,246,0.15); }
+        .modal-overlay { background: rgba(0,0,0,0.5); backdrop-filter: blur(4px); }
+        .model-card { transition: all 0.15s ease; }
+        .model-card:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .privacy-mode .sensitive { filter: blur(6px); }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <!-- 导航栏 -->
+    <nav class="bg-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <i class="fas fa-robot text-3xl text-blue-600 mr-3"></i>
+                    <h1 class="text-2xl font-bold text-gray-800">Kiro API Client</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <button onclick="togglePrivacy()" class="text-gray-600 hover:text-blue-600 transition" title="切换隐私模式">
+                        <i id="privacyIcon" class="fas fa-eye text-xl"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 主内容区 -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Tab 导航 -->
+        <div class="bg-white rounded-lg shadow-md mb-6">
+            <div class="flex border-b overflow-x-auto">
+                <button class="tab-button active px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="token">
+                    <i class="fas fa-key mr-2"></i>Token 管理
+                </button>
+                <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="chat">
+                    <i class="fas fa-comments mr-2"></i>Chat 聊天
+                </button>
+                <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="search">
+                    <i class="fas fa-search mr-2"></i>Web Search
+                </button>
+                <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="mcp">
+                    <i class="fas fa-tools mr-2"></i>MCP 工具
+                </button>
+                <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="mapping">
+                    <i class="fas fa-exchange-alt mr-2"></i>模型映射
+                </button>
+                <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="settings">
+                    <i class="fas fa-cog mr-2"></i>API 设置
+                </button>
+            </div>
+        </div>
+
+        <!-- Token 管理面板 -->
+        <div id="token" class="tab-content active">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-gray-800">
+                        <i class="fas fa-key text-blue-600 mr-2"></i>Token 管理
+                    </h2>
+                    <div class="flex items-center space-x-2">
+                        <button onclick="startLogin()" class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition text-sm">
+                            <i class="fas fa-plus mr-2"></i>新增账号
+                        </button>
+                        <button onclick="refreshTokenStatus()" class="text-blue-600 hover:text-blue-800 transition p-2" title="刷新状态">
+                            <i class="fas fa-sync-alt text-lg"></i>
+                        </button>
+                    </div>
+                </div>
+                <div id="accountsGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+            </div>
+        </div>
+
+        <!-- 登录弹窗 -->
+        <div id="loginModal" class="hidden fixed inset-0 modal-overlay flex items-center justify-center z-50">
+            <div class="bg-white rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl">
+                <h3 class="text-lg font-bold mb-4"><i class="fas fa-sign-in-alt text-blue-600 mr-2"></i>新增账号</h3>
+                <div id="loginContent">
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">登录类型</label>
+                        <div class="flex space-x-2">
+                            <button type="button" onclick="setAuthType('BuilderId')" id="authTypeBuilderId" class="flex-1 px-4 py-2 border-2 border-blue-500 bg-blue-50 text-blue-700 rounded-lg font-medium transition">
+                                <i class="fas fa-user mr-1"></i>个人账号
+                            </button>
+                            <button type="button" onclick="setAuthType('Enterprise')" id="authTypeEnterprise" class="flex-1 px-4 py-2 border-2 border-gray-300 text-gray-600 rounded-lg font-medium transition hover:border-gray-400">
+                                <i class="fas fa-building mr-1"></i>企业账号
+                            </button>
+                            <button type="button" onclick="setAuthType('Import')" id="authTypeImport" class="flex-1 px-4 py-2 border-2 border-gray-300 text-gray-600 rounded-lg font-medium transition hover:border-gray-400">
+                                <i class="fas fa-file-import mr-1"></i>导入Token
+                            </button>
+                        </div>
+                        <p id="authTypeHint" class="text-xs text-gray-500 mt-2"><i class="fas fa-info-circle mr-1"></i>使用 AWS Builder ID 登录</p>
+                    </div>
+                    <div id="enterpriseUrlSection" class="mb-4 hidden">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">企业 SSO URL</label>
+                        <input type="text" id="enterpriseUrl" class="w-full px-4 py-2 border border-gray-300 rounded-lg" placeholder="https://d-xxxxxxxx.awsapps.com/start">
+                    </div>
+                    <div id="importTokenSection" class="mb-4 hidden">
+                        <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-3">
+                            <p class="text-xs text-yellow-800"><i class="fas fa-info-circle mr-1"></i>Token 文件路径: <code class="bg-yellow-100 px-1 rounded">~/.aws/sso/cache/kiro-auth-token.json</code></p>
+                            <p class="text-xs text-yellow-800 mt-1"><i class="fas fa-info-circle mr-1"></i>ClientReg 文件路径: <code class="bg-yellow-100 px-1 rounded">~/.aws/sso/cache/{clientIdHash}.json</code></p>
+                        </div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Token JSON <span class="text-red-500">*</span></label>
+                        <textarea id="importTokenJson" rows="6" class="w-full px-3 py-2 border border-gray-300 rounded-lg font-mono text-xs" placeholder='{
+  "accessToken": "...",
+  "refreshToken": "...",
+  "expiresAt": "2025-02-04T12:00:00Z",
+  "clientIdHash": "...",
+  "authMethod": "BuilderId",
+  "provider": "BuilderId",
+  "region": "us-east-1"
+}'></textarea>
+                        <label class="block text-sm font-medium text-gray-700 mb-2 mt-3">ClientRegistration JSON <span class="text-gray-400">(企业SSO必填)</span></label>
+                        <textarea id="importClientRegJson" rows="4" class="w-full px-3 py-2 border border-gray-300 rounded-lg font-mono text-xs" placeholder='{
+  "clientId": "...",
+  "clientSecret": "..."
+}'></textarea>
+                    </div>
+                    <div id="loginRegionSection" class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">区域</label>
+                        <select id="loginRegion" class="w-full px-4 py-2 border border-gray-300 rounded-lg">
+                            <option value="us-east-1">美国东部 (us-east-1)</option>
+                            <option value="eu-central-1">欧洲中部 (eu-central-1)</option>
+                        </select>
+                    </div>
+                    <button id="loginActionBtn" onclick="doStartLogin()" class="w-full bg-blue-600 text-white px-4 py-3 rounded-lg hover:bg-blue-700 transition">
+                        <i class="fas fa-external-link-alt mr-2"></i>开始登录
+                    </button>
+                </div>
+                <div id="loginPending" class="hidden text-center">
+                    <div class="loading mx-auto mb-4"></div>
+                    <p class="text-gray-600 mb-2">请在浏览器中完成授权</p>
+                    <p class="text-sm text-gray-500 mb-2">用户码: <span id="loginUserCode" class="font-mono font-bold text-blue-600"></span></p>
+                    <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-3">
+                        <p class="text-xs text-yellow-800 font-medium mb-2"><i class="fas fa-exclamation-triangle mr-1"></i>请在隐私窗口中打开链接</p>
+                        <button onclick="copyVerifyUrl()" class="w-full bg-blue-500 hover:bg-blue-600 text-white text-sm py-2 rounded transition">
+                            <i class="fas fa-copy mr-1"></i>复制授权链接
+                        </button>
+                    </div>
+                </div>
+                <div id="loginSuccess" class="hidden text-center">
+                    <i class="fas fa-check-circle text-green-500 text-4xl mb-4"></i>
+                    <p class="text-green-600 font-medium">登录成功！</p>
+                </div>
+                <div id="loginError" class="hidden text-center">
+                    <i class="fas fa-times-circle text-red-500 text-4xl mb-4"></i>
+                    <p id="loginErrorMsg" class="text-red-600"></p>
+                </div>
+                <button onclick="closeLoginModal()" class="mt-4 w-full text-gray-600 hover:text-gray-800 transition text-sm">关闭</button>
+            </div>
+        </div>
+
+        <!-- 账号详情弹窗 -->
+        <div id="accountDetailModal" class="hidden fixed inset-0 modal-overlay flex items-center justify-center z-50 overflow-y-auto">
+            <div class="bg-white rounded-xl max-w-2xl w-full mx-4 my-8 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div class="sticky top-0 bg-white border-b px-6 py-4 flex items-center justify-between">
+                    <div class="flex items-center space-x-3">
+                        <div class="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
+                            <i class="fas fa-user text-blue-600 text-xl"></i>
+                        </div>
+                        <div>
+                            <div class="flex items-center space-x-2">
+                                <span id="detailEmail" class="font-semibold text-gray-800 sensitive"></span>
+                                <span id="detailSubBadge" class="px-2 py-0.5 bg-orange-500 text-white text-xs rounded font-medium"></span>
+                            </div>
+                            <div class="flex items-center space-x-2 text-sm text-gray-500">
+                                <span id="detailProvider"></span>
+                                <span>·</span>
+                                <span>添加于 <span id="detailCreatedAt"></span></span>
+                            </div>
+                        </div>
+                    </div>
+                    <button onclick="closeAccountDetail()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                </div>
+                <div class="p-6 space-y-6">
+                    <!-- 配额总览 -->
+                    <div>
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="font-semibold text-gray-800"><i class="fas fa-chart-bar text-blue-500 mr-2"></i>配额总览</h3>
+                            <button onclick="refreshAccountDetail()" class="text-sm text-blue-600 hover:text-blue-800">
+                                <i class="fas fa-sync-alt mr-1"></i>刷新数据
+                            </button>
+                        </div>
+                        <div class="bg-gray-50 rounded-lg p-4">
+                            <div class="flex items-end justify-between mb-2">
+                                <div>
+                                    <span class="text-3xl font-bold text-gray-800" id="detailUsed">0</span>
+                                    <span class="text-gray-500">/ <span id="detailTotal">0</span></span>
+                                </div>
+                                <span id="detailPercent" class="text-green-600 font-medium"></span>
+                            </div>
+                            <div class="w-full bg-gray-200 rounded-full h-2 mb-4">
+                                <div id="detailProgressBar" class="bg-blue-500 h-2 rounded-full transition-all" style="width: 0%"></div>
+                            </div>
+                            <div class="grid grid-cols-3 gap-4">
+                                <div class="bg-white rounded-lg p-3 border">
+                                    <div class="flex items-center text-sm text-blue-600 mb-1"><span class="w-2 h-2 bg-blue-500 rounded-full mr-2"></span>主配额</div>
+                                    <div class="font-semibold"><span id="detailMainUsed">0</span><span class="text-gray-400 text-sm">/<span id="detailMainTotal">0</span></span></div>
+                                </div>
+                                <div class="bg-white rounded-lg p-3 border">
+                                    <div class="flex items-center text-sm text-gray-500 mb-1"><span class="w-2 h-2 bg-gray-400 rounded-full mr-2"></span>免费试用</div>
+                                    <div class="font-semibold text-gray-400"><span id="detailFreeUsed">0</span><span class="text-gray-300 text-sm">/<span id="detailFreeTotal">0</span></span></div>
+                                </div>
+                                <div class="bg-white rounded-lg p-3 border">
+                                    <div class="flex items-center text-sm text-gray-500 mb-1"><span class="w-2 h-2 bg-gray-400 rounded-full mr-2"></span>奖励总计</div>
+                                    <div class="font-semibold text-gray-400"><span id="detailBonusUsed">0</span><span class="text-gray-300 text-sm">/<span id="detailBonusTotal">0</span></span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 基本信息 + 订阅详情 -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <h3 class="font-semibold text-gray-800 mb-3"><i class="fas fa-user text-blue-500 mr-2"></i>基本信息</h3>
+                            <div class="bg-gray-50 rounded-lg p-4 space-y-3">
+                                <div>
+                                    <div class="text-xs text-gray-500">邮箱/ID</div>
+                                    <div id="detailEmailFull" class="font-medium text-gray-800 sensitive"></div>
+                                </div>
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <div class="text-xs text-gray-500">账号别名</div>
+                                        <div id="detailAlias" class="font-medium text-gray-800">-</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-xs text-gray-500">身份提供商</div>
+                                        <div id="detailProviderFull" class="font-medium text-gray-800"></div>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div class="text-xs text-gray-500">用户 ID</div>
+                                    <div id="detailUserId" class="font-mono text-sm bg-white border rounded p-2 break-all sensitive"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <h3 class="font-semibold text-gray-800 mb-3"><i class="fas fa-link text-blue-500 mr-2"></i>订阅详情</h3>
+                            <div class="bg-gray-50 rounded-lg p-4 space-y-2">
+                                <div class="flex justify-between"><span class="text-gray-500">Region</span><span id="detailRegion" class="font-mono bg-gray-200 px-2 py-0.5 rounded text-sm"></span></div>
+                                <div class="flex justify-between"><span class="text-gray-500">Token 到期</span><span id="detailTokenExpiry" class="text-gray-800"></span></div>
+                                <div class="flex justify-between"><span class="text-gray-500">订阅类型</span><span id="detailSubType" class="text-gray-800">-</span></div>
+                                <div class="flex justify-between"><span class="text-gray-500">超额费率</span><span id="detailOverageRate" class="text-gray-800"></span></div>
+                                <div class="flex justify-between"><span class="text-gray-500">资源类型</span><span id="detailResourceType" class="text-gray-800"></span></div>
+                                <div class="flex justify-between"><span class="text-gray-500">可升级</span><span id="detailCanUpgrade" class="text-gray-800"></span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 可用模型 -->
+                    <div>
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-semibold text-gray-800"><i class="fas fa-cube text-blue-500 mr-2"></i>账户可用模型</h3>
+                            <span id="detailModelCount" class="bg-blue-100 text-blue-700 px-2 py-0.5 rounded text-sm font-medium"></span>
+                        </div>
+                        <div id="detailModelsGrid" class="grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat 聊天面板 -->
+        <div id="chat" class="tab-content">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-comments text-blue-600 mr-2"></i>AI 聊天</h2>
+                <div class="mb-4 flex items-center space-x-4">
+                    <label class="text-sm font-medium text-gray-700">模型选择:</label>
+                    <select id="modelSelect" class="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <div id="chatMessages" class="h-96 overflow-y-auto mb-4 p-4 bg-gray-50 rounded-lg space-y-4">
+                    <div class="text-center text-gray-500 py-8"><i class="fas fa-comment-dots text-4xl mb-2"></i><p>开始对话吧！</p></div>
+                </div>
+                <div class="flex space-x-4">
+                    <input type="text" id="chatInput" class="flex-1 px-4 py-2 border border-gray-300 rounded-lg" placeholder="输入消息..." onkeypress="if(event.key==='Enter') sendChat()">
+                    <label class="flex items-center space-x-2"><input type="checkbox" id="streamMode" checked class="w-4 h-4"><span class="text-sm text-gray-700">流式</span></label>
+                    <button onclick="sendChat()" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition"><i class="fas fa-paper-plane mr-2"></i>发送</button>
+                    <button onclick="clearChat()" class="bg-gray-600 text-white px-6 py-2 rounded-lg hover:bg-gray-700 transition"><i class="fas fa-trash mr-2"></i>清空</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Web Search 面板 -->
+        <div id="search" class="tab-content">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-search text-blue-600 mr-2"></i>Web 搜索</h2>
+                <div class="flex space-x-4 mb-6">
+                    <input type="text" id="searchQuery" class="flex-1 px-4 py-2 border border-gray-300 rounded-lg" placeholder="输入搜索关键词..." onkeypress="if(event.key==='Enter') performSearch()">
+                    <input type="number" id="maxResults" value="10" min="1" max="50" class="w-24 px-4 py-2 border border-gray-300 rounded-lg" placeholder="数量">
+                    <button onclick="performSearch()" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition"><i class="fas fa-search mr-2"></i>搜索</button>
+                </div>
+                <div id="searchResults" class="space-y-4">
+                    <div class="text-center text-gray-500 py-8"><i class="fas fa-search text-4xl mb-2"></i><p>输入关键词开始搜索</p></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- MCP 工具面板 -->
+        <div id="mcp" class="tab-content">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-tools text-blue-600 mr-2"></i>MCP 工具</h2>
+                <div class="mb-6">
+                    <button onclick="loadTools()" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition mb-4"><i class="fas fa-sync-alt mr-2"></i>加载工具列表</button>
+                    <div id="toolsList" class="space-y-2">
+                        <div class="text-center text-gray-500 py-8"><i class="fas fa-tools text-4xl mb-2"></i><p>点击按钮加载可用工具</p></div>
+                    </div>
+                </div>
+                <div id="toolCallSection" class="hidden">
+                    <h3 class="text-lg font-semibold mb-3">调用工具</h3>
+                    <div class="space-y-4">
+                        <div><label class="block text-sm font-medium text-gray-700 mb-2">工具名称</label><input type="text" id="toolName" readonly class="w-full px-4 py-2 border border-gray-300 rounded-lg bg-gray-50"></div>
+                        <div><label class="block text-sm font-medium text-gray-700 mb-2">参数 (JSON)</label><textarea id="toolArgs" rows="4" class="w-full px-4 py-2 border border-gray-300 rounded-lg font-mono text-sm" placeholder='{"query": "test"}'></textarea></div>
+                        <button onclick="callTool()" class="bg-green-600 text-white px-6 py-2 rounded-lg hover:bg-green-700 transition"><i class="fas fa-play mr-2"></i>执行</button>
+                    </div>
+                    <div id="toolResult" class="mt-4 hidden"><h3 class="text-lg font-semibold mb-3">执行结果</h3><div class="p-4 bg-gray-50 rounded-lg"><pre id="toolResultContent" class="text-sm overflow-x-auto"></pre></div></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 模型映射面板 -->
+        <div id="mapping" class="tab-content">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-exchange-alt text-blue-600 mr-2"></i>模型映射配置</h2>
+                <p class="text-gray-600 mb-4">配置外部模型ID到Kiro内部模型ID的映射关系</p>
+                <div class="mb-4">
+                    <button onclick="loadModelMapping(true)" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition mr-2"><i class="fas fa-sync-alt mr-2"></i>加载配置</button>
+                    <button onclick="saveModelMapping()" class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition mr-2"><i class="fas fa-save mr-2"></i>保存配置</button>
+                    <button onclick="addMappingRow()" class="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition"><i class="fas fa-plus mr-2"></i>添加映射</button>
+                </div>
+                <div id="mappingTable" class="space-y-2"></div>
+            </div>
+        </div>
+
+        <!-- API 设置面板 -->
+        <div id="settings" class="tab-content">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-key text-blue-600 mr-2"></i>API-KEY 设置</h2>
+                <div class="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+                    <p class="text-sm text-blue-800"><i class="fas fa-info-circle mr-2"></i>配置 API-KEY 后，所有 OpenAI/Claude 格式的请求都需要携带有效的 API-KEY 才能访问。</p>
+                    <p class="text-xs text-blue-600 mt-2">支持两种格式：</p>
+                    <ul class="text-xs text-blue-600 mt-1 ml-4 list-disc">
+                        <li>Claude 格式: <code class="bg-blue-100 px-1 rounded">X-API-Key: sk-xxx</code></li>
+                        <li>OpenAI 格式: <code class="bg-blue-100 px-1 rounded">Authorization: Bearer sk-xxx</code></li>
+                    </ul>
+                </div>
+                <div class="mb-4 flex space-x-2">
+                    <button onclick="loadApiKeysConfig(true)" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition"><i class="fas fa-sync-alt mr-2"></i>加载配置</button>
+                    <button onclick="saveApiKeysConfig()" class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition"><i class="fas fa-save mr-2"></i>保存配置</button>
+                    <button onclick="addApiKeyRow()" class="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition"><i class="fas fa-plus mr-2"></i>添加 KEY</button>
+                    <button onclick="generateApiKey()" class="bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition"><i class="fas fa-magic mr-2"></i>生成随机 KEY</button>
+                </div>
+                <div id="apiKeysTable" class="space-y-2">
+                    <div class="text-center text-gray-500 py-4">点击"加载配置"查看当前 API-KEY</div>
+                </div>
+                <div class="mt-6 p-4 bg-gray-50 rounded-lg">
+                    <h3 class="font-medium text-gray-800 mb-2"><i class="fas fa-terminal mr-2"></i>测试命令</h3>
+                    <p class="text-xs text-gray-500 mb-2">使用以下命令测试 API-KEY 是否生效：</p>
+                    <pre class="bg-gray-800 text-green-400 p-3 rounded text-xs overflow-x-auto">curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}'</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div id="toast" class="hidden fixed bottom-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 transition-all"></div>
+
+    <script>
+        // 全局状态
+        let privacyMode = false;
+        let currentLoginSession = null;
+        let loginPollTimer = null;
+        let chatHistory = [];
+        let currentDetailAccountId = null;
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            initTabs();
+            loadAccounts();
+            loadModels();
+            loadApiKeysConfig();  // 自动加载 API-KEY 配置
+            loadModelMapping();   // 自动加载模型映射配置
+        });
+
+        // Tab 切换
+        function initTabs() {
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    btn.classList.add('active');
+                    document.getElementById(btn.dataset.tab).classList.add('active');
+                });
+            });
+        }
+
+        // Toast 通知
+        function showToast(msg, type = 'info') {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.className = 'fixed bottom-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 transition-all';
+            if (type === 'success') toast.classList.add('bg-green-500', 'text-white');
+            else if (type === 'error') toast.classList.add('bg-red-500', 'text-white');
+            else toast.classList.add('bg-blue-500', 'text-white');
+            toast.classList.remove('hidden');
+            setTimeout(() => toast.classList.add('hidden'), 3000);
+        }
+
+        // 隐私模式
+        function togglePrivacy() {
+            privacyMode = !privacyMode;
+            document.body.classList.toggle('privacy-mode', privacyMode);
+            document.getElementById('privacyIcon').className = privacyMode ? 'fas fa-eye-slash text-xl' : 'fas fa-eye text-xl';
+            showToast(privacyMode ? '隐私模式已开启' : '隐私模式已关闭');
+        }
+
+        // ========== 登录流程 ==========
+        let currentAuthType = 'BuilderId';
+
+        function startLogin() {
+            document.getElementById('loginModal').classList.remove('hidden');
+            document.getElementById('loginContent').classList.remove('hidden');
+            document.getElementById('loginPending').classList.add('hidden');
+            document.getElementById('loginSuccess').classList.add('hidden');
+            document.getElementById('loginError').classList.add('hidden');
+            setAuthType('BuilderId');
+        }
+
+        function setAuthType(type) {
+            currentAuthType = type;
+            const builderBtn = document.getElementById('authTypeBuilderId');
+            const enterpriseBtn = document.getElementById('authTypeEnterprise');
+            const importBtn = document.getElementById('authTypeImport');
+            const enterpriseSection = document.getElementById('enterpriseUrlSection');
+            const importSection = document.getElementById('importTokenSection');
+            const regionSection = document.getElementById('loginRegionSection');
+            const hint = document.getElementById('authTypeHint');
+            const actionBtn = document.getElementById('loginActionBtn');
+            // 重置所有按钮样式
+            builderBtn.className = 'flex-1 px-4 py-2 border-2 border-gray-300 text-gray-600 rounded-lg font-medium transition hover:border-gray-400';
+            enterpriseBtn.className = 'flex-1 px-4 py-2 border-2 border-gray-300 text-gray-600 rounded-lg font-medium transition hover:border-gray-400';
+            importBtn.className = 'flex-1 px-4 py-2 border-2 border-gray-300 text-gray-600 rounded-lg font-medium transition hover:border-gray-400';
+            enterpriseSection.classList.add('hidden');
+            importSection.classList.add('hidden');
+            regionSection.classList.remove('hidden');
+            if (type === 'BuilderId') {
+                builderBtn.className = 'flex-1 px-4 py-2 border-2 border-blue-500 bg-blue-50 text-blue-700 rounded-lg font-medium transition';
+                hint.innerHTML = '<i class="fas fa-info-circle mr-1"></i>使用 AWS Builder ID 登录';
+                actionBtn.innerHTML = '<i class="fas fa-external-link-alt mr-2"></i>开始登录';
+                actionBtn.onclick = doStartLogin;
+            } else if (type === 'Enterprise') {
+                enterpriseBtn.className = 'flex-1 px-4 py-2 border-2 border-blue-500 bg-blue-50 text-blue-700 rounded-lg font-medium transition';
+                enterpriseSection.classList.remove('hidden');
+                hint.innerHTML = '<i class="fas fa-info-circle mr-1"></i>使用企业 IAM Identity Center 登录';
+                actionBtn.innerHTML = '<i class="fas fa-external-link-alt mr-2"></i>开始登录';
+                actionBtn.onclick = doStartLogin;
+            } else if (type === 'Import') {
+                importBtn.className = 'flex-1 px-4 py-2 border-2 border-blue-500 bg-blue-50 text-blue-700 rounded-lg font-medium transition';
+                importSection.classList.remove('hidden');
+                regionSection.classList.add('hidden');
+                hint.innerHTML = '<i class="fas fa-info-circle mr-1"></i>直接导入已有的 Token JSON（适用于企业 SSO 或手动迁移）';
+                actionBtn.innerHTML = '<i class="fas fa-file-import mr-2"></i>导入账号';
+                actionBtn.onclick = doImportToken;
+            }
+        }
+
+        async function doImportToken() {
+            const tokenJson = document.getElementById('importTokenJson').value.trim();
+            const clientRegJson = document.getElementById('importClientRegJson').value.trim();
+            if (!tokenJson) { showToast('请输入 Token JSON', 'error'); return; }
+            // 验证 JSON 格式
+            try { JSON.parse(tokenJson); } catch (e) { showToast('Token JSON 格式错误: ' + e.message, 'error'); return; }
+            if (clientRegJson) {
+                try { JSON.parse(clientRegJson); } catch (e) { showToast('ClientRegistration JSON 格式错误: ' + e.message, 'error'); return; }
+            }
+            try {
+                const resp = await fetch('/api/auth/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tokenJson, clientRegJson })
+                });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                document.getElementById('loginContent').classList.add('hidden');
+                document.getElementById('loginSuccess').classList.remove('hidden');
+                showToast('账号导入成功！', 'success');
+                setTimeout(() => { closeLoginModal(); location.reload(); }, 1500);
+            } catch (e) { showToast('导入失败: ' + e.message, 'error'); }
+        }
+
+        async function doStartLogin() {
+            const region = document.getElementById('loginRegion').value;
+            let startUrl = '';
+            if (currentAuthType === 'Enterprise') {
+                startUrl = document.getElementById('enterpriseUrl').value.trim();
+                if (!startUrl) { showToast('请输入企业 SSO URL', 'error'); return; }
+            }
+            try {
+                const resp = await fetch('/api/auth/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ region, startUrl })
+                });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                currentLoginSession = data;
+                document.getElementById('loginContent').classList.add('hidden');
+                document.getElementById('loginPending').classList.remove('hidden');
+                document.getElementById('loginUserCode').textContent = data.userCode;
+                startLoginPolling(data.sessionId);
+            } catch (e) { showToast('启动登录失败: ' + e.message, 'error'); }
+        }
+
+        function startLoginPolling(sessionId) {
+            if (loginPollTimer) clearInterval(loginPollTimer);
+            loginPollTimer = setInterval(async () => {
+                try {
+                    const resp = await fetch(`/api/auth/poll/${sessionId}`);
+                    const data = await resp.json();
+                    if (data.status === 'success') {
+                        clearInterval(loginPollTimer);
+                        document.getElementById('loginPending').classList.add('hidden');
+                        document.getElementById('loginSuccess').classList.remove('hidden');
+                        showToast('登录成功！', 'success');
+                        setTimeout(() => { closeLoginModal(); location.reload(); }, 1500);
+                    } else if (data.error) {
+                        clearInterval(loginPollTimer);
+                        document.getElementById('loginPending').classList.add('hidden');
+                        document.getElementById('loginError').classList.remove('hidden');
+                        document.getElementById('loginErrorMsg').textContent = data.error;
+                    }
+                } catch (e) { console.error('轮询失败:', e); }
+            }, 3000);
+        }
+
+        function copyVerifyUrl() {
+            if (currentLoginSession && currentLoginSession.verifyUrl) {
+                navigator.clipboard.writeText(currentLoginSession.verifyUrl);
+                showToast('授权链接已复制', 'success');
+            }
+        }
+
+        function closeLoginModal() {
+            document.getElementById('loginModal').classList.add('hidden');
+            if (loginPollTimer) { clearInterval(loginPollTimer); loginPollTimer = null; }
+            currentLoginSession = null;
+        }
+
+        // ========== 账号管理 ==========
+        async function loadAccounts() {
+            try {
+                const resp = await fetch('/api/accounts');
+                const data = await resp.json();
+                renderAccounts(data.accounts || []);
+            } catch (e) { showToast('加载账号失败: ' + e.message, 'error'); }
+        }
+
+        // 格式化用户ID显示（提取邮箱或简短ID）
+        function formatUserId(acc) {
+            // 优先显示邮箱
+            if (acc.email && acc.email.trim()) return acc.email;
+            // 如果有 userId，提取 UUID 部分（去掉 d-xxxxxxxx. 前缀）
+            if (acc.userId) {
+                const parts = acc.userId.split('.');
+                if (parts.length === 2) return parts[1]; // 只显示 UUID 部分
+                return acc.userId;
+            }
+            // 最后使用 ID 的前8位
+            return acc.id ? acc.id.substring(0, 8) : '未知';
+        }
+
+        function renderAccounts(accounts) {
+            const grid = document.getElementById('accountsGrid');
+            if (!accounts || accounts.length === 0) {
+                grid.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8"><i class="fas fa-user-plus text-4xl mb-2"></i><p>暂无账号，点击"新增账号"添加</p></div>';
+                return;
+            }
+            grid.innerHTML = accounts.map(acc => {
+                const usedPct = acc.totalCredits > 0 ? Math.round((acc.usedCredits / acc.totalCredits) * 100) : 0;
+                const remaining = acc.totalCredits - acc.usedCredits;
+                const isExpired = acc.token && acc.token.isExpired;
+                const subName = acc.subscriptionName || 'FREE';
+                const badgeColor = subName === 'POWER' ? 'bg-orange-500' : 'bg-gray-500';
+                const email = formatUserId(acc);
+                return `
+                <div class="account-card bg-white border rounded-xl p-4 hover:shadow-lg" onclick="showAccountDetail('${acc.id}')">
+                    <div class="flex items-start justify-between mb-3">
+                        <div class="flex items-center space-x-3">
+                            <div class="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
+                                <i class="fas fa-user text-blue-600"></i>
+                            </div>
+                            <div>
+                                <div class="font-medium text-gray-800 sensitive">${email}</div>
+                                <span class="px-2 py-0.5 ${badgeColor} text-white text-xs rounded font-medium">KIRO ${subName}</span>
+                            </div>
+                        </div>
+                        <div class="flex space-x-1" onclick="event.stopPropagation()">
+                            <button onclick="refreshAccount('${acc.id}')" class="p-2 text-blue-600 hover:bg-blue-50 rounded" title="刷新Token"><i class="fas fa-sync-alt"></i></button>
+                            <button onclick="deleteAccount('${acc.id}')" class="p-2 text-red-600 hover:bg-red-50 rounded" title="删除"><i class="fas fa-trash"></i></button>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <div class="flex justify-between text-sm mb-1">
+                            <span class="text-gray-500">已用 ${acc.usedCredits.toFixed(1)} / ${acc.totalCredits.toFixed(0)}</span>
+                            <span class="text-gray-600">${usedPct}%</span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2">
+                            <div class="h-2 rounded-full transition-all ${usedPct > 80 ? 'bg-red-500' : usedPct > 50 ? 'bg-yellow-500' : 'bg-blue-500'}" style="width: ${usedPct}%"></div>
+                        </div>
+                    </div>
+                    <div class="flex justify-between text-sm">
+                        <span class="text-gray-500"><i class="fas fa-calendar mr-1"></i>${acc.daysUntilReset || 0} 天后重置</span>
+                        <span class="${isExpired ? 'text-red-500' : acc.tokenMinutesLeft < 30 ? 'text-yellow-500' : 'text-green-500'}"><i class="fas fa-${isExpired ? 'times-circle' : 'clock'} mr-1"></i>${isExpired ? 'Token 已过期' : acc.tokenMinutesLeft + ' 分钟'}</span>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function refreshTokenStatus() { loadAccounts(); showToast('正在刷新...'); }
+
+        async function deleteAccount(id) {
+            if (!confirm('确定要删除此账号吗？')) return;
+            try {
+                const resp = await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                showToast('账号已删除', 'success');
+                loadAccounts();
+            } catch (e) { showToast('删除失败: ' + e.message, 'error'); }
+        }
+
+        async function refreshAccount(id) {
+            try {
+                showToast('正在刷新 Token...');
+                const resp = await fetch(`/api/accounts/${id}/refresh`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                showToast('Token 已刷新', 'success');
+                loadAccounts();
+            } catch (e) { showToast('刷新失败: ' + e.message, 'error'); }
+        }
+
+        // ========== 账号详情弹窗 ==========
+        async function showAccountDetail(accountId) {
+            currentDetailAccountId = accountId;
+            document.getElementById('accountDetailModal').classList.remove('hidden');
+            try {
+                const resp = await fetch(`/api/accounts/${accountId}/detail`);
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                renderAccountDetail(data);
+            } catch (e) { showToast('加载详情失败: ' + e.message, 'error'); }
+        }
+
+        function closeAccountDetail() {
+            document.getElementById('accountDetailModal').classList.add('hidden');
+            currentDetailAccountId = null;
+        }
+
+        async function refreshAccountDetail() {
+            if (currentDetailAccountId) {
+                showToast('正在刷新...');
+                await showAccountDetail(currentDetailAccountId);
+            }
+        }
+
+        function renderAccountDetail(data) {
+            const displayName = formatUserId(data);
+            const subName = data.subscriptionName || 'FREE';
+            const badgeColor = subName === 'POWER' ? 'bg-orange-500' : 'bg-gray-500';
+            document.getElementById('detailEmail').textContent = displayName;
+            document.getElementById('detailSubBadge').textContent = 'KIRO ' + subName;
+            document.getElementById('detailSubBadge').className = `px-2 py-0.5 ${badgeColor} text-white text-xs rounded font-medium`;
+            document.getElementById('detailProvider').textContent = data.provider || 'BuilderId';
+            document.getElementById('detailCreatedAt').textContent = data.createdAt ? data.createdAt.split('T')[0] : '-';
+            // 配额
+            const usedPct = data.totalCredits > 0 ? Math.round((data.usedCredits / data.totalCredits) * 100) : 0;
+            document.getElementById('detailUsed').textContent = data.usedCredits.toFixed(1);
+            document.getElementById('detailTotal').textContent = data.totalCredits.toFixed(0);
+            document.getElementById('detailPercent').textContent = `剩余 ${(data.totalCredits - data.usedCredits).toFixed(1)}`;
+            document.getElementById('detailProgressBar').style.width = usedPct + '%';
+            document.getElementById('detailMainUsed').textContent = data.mainQuota ? data.mainQuota.used.toFixed(1) : '0';
+            document.getElementById('detailMainTotal').textContent = data.mainQuota ? data.mainQuota.total.toFixed(0) : '0';
+            document.getElementById('detailFreeUsed').textContent = data.freeQuota ? data.freeQuota.used.toFixed(1) : '0';
+            document.getElementById('detailFreeTotal').textContent = data.freeQuota ? data.freeQuota.total.toFixed(0) : '0';
+            document.getElementById('detailBonusUsed').textContent = data.bonusQuota ? data.bonusQuota.used.toFixed(1) : '0';
+            document.getElementById('detailBonusTotal').textContent = data.bonusQuota ? data.bonusQuota.total.toFixed(0) : '0';
+            // 基本信息
+            document.getElementById('detailEmailFull').textContent = displayName;
+            document.getElementById('detailAlias').textContent = '-';
+            document.getElementById('detailProviderFull').textContent = data.provider || 'BuilderId';
+            document.getElementById('detailUserId').textContent = data.userId || '-';
+            // 订阅详情
+            document.getElementById('detailRegion').textContent = data.region || 'us-east-1';
+            document.getElementById('detailTokenExpiry').textContent = data.tokenExpiry ? formatExpiry(data.tokenExpiry, data.minutesLeft) : '-';
+            document.getElementById('detailSubType').textContent = subName;
+            document.getElementById('detailOverageRate').textContent = data.overageRate || '$0.04/INVOCATIONS';
+            document.getElementById('detailResourceType').textContent = data.resourceType || 'CREDIT';
+            document.getElementById('detailCanUpgrade').textContent = data.canUpgrade ? '是' : '否';
+            // 模型
+            renderDetailModels(data.models || []);
+        }
+
+        function formatExpiry(expiry, minutesLeft) {
+            const date = new Date(expiry);
+            const timeStr = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+            return `${timeStr} (${minutesLeft || 0}分钟后)`;
+        }
+
+        function renderDetailModels(models) {
+            const grid = document.getElementById('detailModelsGrid');
+            document.getElementById('detailModelCount').textContent = models.length + ' 个模型';
+            if (!models || models.length === 0) {
+                grid.innerHTML = '<div class="col-span-2 text-center text-gray-500 py-4">暂无可用模型</div>';
+                return;
+            }
+            grid.innerHTML = models.map(m => `
+                <div class="model-card bg-gray-50 rounded-lg p-3 border hover:border-blue-300">
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="font-medium text-gray-800">${m.name}</span>
+                        <span class="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">${m.credit}x</span>
+                    </div>
+                    <div class="text-xs text-gray-500">${m.description || ''}</div>
+                    <div class="text-xs text-gray-400 mt-1 font-mono">${m.id}</div>
+                </div>
+            `).join('');
+        }
+
+        // ========== Chat 功能 ==========
+        async function loadModels() {
+            try {
+                const resp = await fetch('/api/models');
+                const data = await resp.json();
+                const select = document.getElementById('modelSelect');
+                select.innerHTML = (data.models || []).map(m => `<option value="${m.id}">${m.name} (${m.credit}x)</option>`).join('');
+            } catch (e) { console.error('加载模型失败:', e); }
+        }
+
+        async function sendChat() {
+            const input = document.getElementById('chatInput');
+            const msg = input.value.trim();
+            if (!msg) return;
+            input.value = '';
+            const model = document.getElementById('modelSelect').value;
+            const stream = document.getElementById('streamMode').checked;
+            chatHistory.push({ role: 'user', content: msg });
+            appendChatMessage('user', msg);
+            if (stream) {
+                await sendStreamChat(model);
+            } else {
+                await sendNonStreamChat(model);
+            }
+        }
+
+        async function sendStreamChat(model) {
+            const msgDiv = appendChatMessage('assistant', '');
+            const contentSpan = msgDiv.querySelector('.content');
+            try {
+                const resp = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: chatHistory, stream: true, model })
+                });
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let fullContent = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') continue;
+                            try {
+                                const json = JSON.parse(data);
+                                if (json.content) { fullContent += json.content; contentSpan.textContent = fullContent; }
+                            } catch (e) {}
+                        }
+                    }
+                }
+                chatHistory.push({ role: 'assistant', content: fullContent });
+            } catch (e) { contentSpan.textContent = '请求失败: ' + e.message; }
+        }
+
+        async function sendNonStreamChat(model) {
+            const msgDiv = appendChatMessage('assistant', '思考中...');
+            const contentSpan = msgDiv.querySelector('.content');
+            try {
+                const resp = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: chatHistory, stream: false, model })
+                });
+                const data = await resp.json();
+                if (data.error) { contentSpan.textContent = '错误: ' + data.error; return; }
+                contentSpan.textContent = data.content;
+                chatHistory.push({ role: 'assistant', content: data.content });
+            } catch (e) { contentSpan.textContent = '请求失败: ' + e.message; }
+        }
+
+        function appendChatMessage(role, content) {
+            const container = document.getElementById('chatMessages');
+            if (container.querySelector('.text-center')) container.innerHTML = '';
+            const div = document.createElement('div');
+            div.className = `message p-3 rounded-lg ${role === 'user' ? 'bg-blue-100 ml-12' : 'bg-gray-100 mr-12'}`;
+            div.innerHTML = `<div class="text-xs text-gray-500 mb-1">${role === 'user' ? '你' : 'AI'}</div><div class="content text-gray-800 whitespace-pre-wrap">${content}</div>`;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+            return div;
+        }
+
+        function clearChat() { chatHistory = []; document.getElementById('chatMessages').innerHTML = '<div class="text-center text-gray-500 py-8"><i class="fas fa-comment-dots text-4xl mb-2"></i><p>开始对话吧！</p></div>'; }
+
+        // ========== 搜索功能 ==========
+        async function performSearch() {
+            const query = document.getElementById('searchQuery').value.trim();
+            if (!query) { showToast('请输入搜索关键词', 'error'); return; }
+            const maxResults = parseInt(document.getElementById('maxResults').value) || 10;
+            const resultsDiv = document.getElementById('searchResults');
+            resultsDiv.innerHTML = '<div class="text-center py-8"><div class="loading mx-auto"></div><p class="mt-2 text-gray-500">搜索中...</p></div>';
+            try {
+                const resp = await fetch('/api/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query, maxResults })
+                });
+                const data = await resp.json();
+                if (data.error) { resultsDiv.innerHTML = `<div class="text-center text-red-500 py-8">${data.error}</div>`; return; }
+                if (!data.results || data.results.length === 0) { resultsDiv.innerHTML = '<div class="text-center text-gray-500 py-8">未找到结果</div>'; return; }
+                resultsDiv.innerHTML = data.results.map(r => `
+                    <div class="p-4 bg-gray-50 rounded-lg border hover:border-blue-300 transition">
+                        <a href="${r.url}" target="_blank" class="text-blue-600 hover:underline font-medium">${r.title}</a>
+                        <p class="text-sm text-gray-600 mt-1">${r.snippet}</p>
+                        <div class="text-xs text-gray-400 mt-2">${r.domain} ${r.publishedDate ? '· ' + new Date(r.publishedDate).toLocaleDateString() : ''}</div>
+                    </div>
+                `).join('');
+            } catch (e) { resultsDiv.innerHTML = `<div class="text-center text-red-500 py-8">搜索失败: ${e.message}</div>`; }
+        }
+
+        // ========== MCP 工具 ==========
+        async function loadTools() {
+            const listDiv = document.getElementById('toolsList');
+            listDiv.innerHTML = '<div class="text-center py-4"><div class="loading mx-auto"></div></div>';
+            try {
+                const resp = await fetch('/api/tools');
+                const data = await resp.json();
+                if (data.error) { listDiv.innerHTML = `<div class="text-center text-red-500 py-4">${data.error}</div>`; return; }
+                if (!data.tools || data.tools.length === 0) { listDiv.innerHTML = '<div class="text-center text-gray-500 py-4">暂无可用工具</div>'; return; }
+                listDiv.innerHTML = data.tools.map(t => `
+                    <div class="p-3 bg-gray-50 rounded-lg border hover:border-blue-300 cursor-pointer transition" onclick="selectTool('${t.name}', ${JSON.stringify(JSON.stringify(t.inputSchema))})">
+                        <div class="font-medium text-gray-800">${t.name}</div>
+                        <div class="text-sm text-gray-500">${t.description}</div>
+                    </div>
+                `).join('');
+            } catch (e) { listDiv.innerHTML = `<div class="text-center text-red-500 py-4">加载失败: ${e.message}</div>`; }
+        }
+
+        function selectTool(name, schema) {
+            document.getElementById('toolName').value = name;
+            document.getElementById('toolArgs').value = JSON.stringify(JSON.parse(schema).properties ? Object.fromEntries(Object.keys(JSON.parse(schema).properties).map(k => [k, ''])) : {}, null, 2);
+            document.getElementById('toolCallSection').classList.remove('hidden');
+            document.getElementById('toolResult').classList.add('hidden');
+        }
+
+        async function callTool() {
+            const name = document.getElementById('toolName').value;
+            let args = {};
+            try { args = JSON.parse(document.getElementById('toolArgs').value || '{}'); } catch (e) { showToast('参数 JSON 格式错误', 'error'); return; }
+            const resultDiv = document.getElementById('toolResult');
+            const contentPre = document.getElementById('toolResultContent');
+            resultDiv.classList.remove('hidden');
+            contentPre.textContent = '执行中...';
+            try {
+                const resp = await fetch('/api/tools/call', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, arguments: args })
+                });
+                const data = await resp.json();
+                if (data.error) { contentPre.textContent = '错误: ' + data.error; return; }
+                contentPre.textContent = JSON.stringify(data.content, null, 2);
+            } catch (e) { contentPre.textContent = '执行失败: ' + e.message; }
+        }
+
+        // ========== 模型映射 ==========
+        let currentMapping = {};
+        let currentMappingHash = '';
+
+        async function loadModelMapping(showMsg = false) {
+            try {
+                const resp = await fetch('/api/model-mapping');
+                const data = await resp.json();
+                currentMapping = data.mapping || {};
+                currentMappingHash = data.hash || '';
+                renderMappingTable();
+                if (showMsg) showToast('配置已加载', 'success');
+            } catch (e) { showToast('加载失败: ' + e.message, 'error'); }
+        }
+
+        function renderMappingTable() {
+            const table = document.getElementById('mappingTable');
+            const entries = Object.entries(currentMapping);
+            if (entries.length === 0) { table.innerHTML = '<div class="text-center text-gray-500 py-4">暂无映射配置</div>'; return; }
+            table.innerHTML = entries.map(([from, to], i) => `
+                <div class="flex items-center space-x-2 p-2 bg-gray-50 rounded">
+                    <input type="text" value="${from}" class="flex-1 px-3 py-2 border rounded text-sm" data-index="${i}" data-field="from">
+                    <i class="fas fa-arrow-right text-gray-400"></i>
+                    <input type="text" value="${to}" class="flex-1 px-3 py-2 border rounded text-sm" data-index="${i}" data-field="to">
+                    <button onclick="removeMappingRow(${i})" class="p-2 text-red-600 hover:bg-red-50 rounded"><i class="fas fa-trash"></i></button>
+                </div>
+            `).join('');
+        }
+
+        function addMappingRow() {
+            currentMapping['new-model-id'] = 'claude-sonnet-4.5';
+            renderMappingTable();
+        }
+
+        function removeMappingRow(index) {
+            const keys = Object.keys(currentMapping);
+            if (keys[index]) { delete currentMapping[keys[index]]; renderMappingTable(); }
+        }
+
+        async function saveModelMapping() {
+            const inputs = document.querySelectorAll('#mappingTable input');
+            const newMapping = {};
+            for (let i = 0; i < inputs.length; i += 2) {
+                const from = inputs[i].value.trim();
+                const to = inputs[i + 1].value.trim();
+                if (from && to) newMapping[from] = to;
+            }
+            try {
+                const resp = await fetch('/api/model-mapping', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mapping: newMapping, hash: currentMappingHash })
+                });
+                const data = await resp.json();
+                if (resp.status === 409) {
+                    showToast(data.error || '配置已被修改，请刷新后重试', 'error');
+                    return;
+                }
+                if (data.error) { showToast(data.error, 'error'); return; }
+                currentMapping = newMapping;
+                currentMappingHash = data.hash || '';
+                showToast('配置已保存', 'success');
+            } catch (e) { showToast('保存失败: ' + e.message, 'error'); }
+        }
+
+        // ========== API-KEY 设置 ==========
+        let currentApiKeys = [];
+        let currentApiKeysHash = '';
+
+        async function loadApiKeysConfig(showMsg = false) {
+            try {
+                const resp = await fetch('/api/settings/api-keys');
+                const data = await resp.json();
+                currentApiKeys = (data.keys || []).map(k => k.full);
+                currentApiKeysHash = data.hash || '';
+                renderApiKeysTable();
+                if (showMsg) showToast(`已加载 ${data.count} 个 API-KEY`, 'success');
+            } catch (e) { showToast('加载失败: ' + e.message, 'error'); }
+        }
+
+        function renderApiKeysTable() {
+            const table = document.getElementById('apiKeysTable');
+            if (currentApiKeys.length === 0) {
+                table.innerHTML = '<div class="text-center text-gray-500 py-4"><i class="fas fa-unlock text-2xl mb-2"></i><p>未配置 API-KEY，所有请求无需认证</p></div>';
+                return;
+            }
+            table.innerHTML = currentApiKeys.map((key, i) => `
+                <div class="flex items-center space-x-2 p-3 bg-gray-50 rounded border">
+                    <span class="text-gray-500 text-sm w-8">#${i + 1}</span>
+                    <input type="text" value="${key}" class="flex-1 px-3 py-2 border rounded text-sm font-mono api-key-input" data-index="${i}">
+                    <button onclick="copyApiKey(${i})" class="p-2 text-blue-600 hover:bg-blue-50 rounded" title="复制"><i class="fas fa-copy"></i></button>
+                    <button onclick="removeApiKeyRow(${i})" class="p-2 text-red-600 hover:bg-red-50 rounded" title="删除"><i class="fas fa-trash"></i></button>
+                </div>
+            `).join('');
+        }
+
+        function addApiKeyRow() {
+            currentApiKeys.push('sk-');
+            renderApiKeysTable();
+            // 聚焦到新添加的输入框
+            setTimeout(() => {
+                const inputs = document.querySelectorAll('.api-key-input');
+                if (inputs.length > 0) inputs[inputs.length - 1].focus();
+            }, 100);
+        }
+
+        function removeApiKeyRow(index) {
+            currentApiKeys.splice(index, 1);
+            renderApiKeysTable();
+        }
+
+        function copyApiKey(index) {
+            const key = currentApiKeys[index];
+            navigator.clipboard.writeText(key);
+            showToast('API-KEY 已复制', 'success');
+        }
+
+        function generateApiKey() {
+            // 生成随机 API-KEY: sk- + 48位随机字符
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            let key = 'sk-';
+            for (let i = 0; i < 48; i++) {
+                key += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            currentApiKeys.push(key);
+            renderApiKeysTable();
+            showToast('已生成新的 API-KEY', 'success');
+        }
+
+        async function saveApiKeysConfig() {
+            // 从输入框获取最新值
+            const inputs = document.querySelectorAll('.api-key-input');
+            const keys = Array.from(inputs).map(input => input.value.trim()).filter(k => k);
+            try {
+                const resp = await fetch('/api/settings/api-keys', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keys, hash: currentApiKeysHash })
+                });
+                const data = await resp.json();
+                if (resp.status === 409) {
+                    showToast(data.error || '配置已被修改，请刷新后重试', 'error');
+                    return;
+                }
+                if (data.error) { showToast(data.error, 'error'); return; }
+                currentApiKeys = keys;
+                currentApiKeysHash = data.hash || '';
+                showToast(`配置已保存，共 ${data.count} 个 API-KEY`, 'success');
+            } catch (e) { showToast('保存失败: ' + e.message, 'error'); }
+        }
+    </script>
+</body>
+</html>
