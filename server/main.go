@@ -129,6 +129,25 @@ var ipBlacklistFile = "ip-blacklist.json"
 var ipBlacklist []string
 var ipBlacklistMutex sync.RWMutex
 
+// ========== 限流器 ==========
+var rateLimitFile = "rate-limit.json"
+var rateLimitConfig RateLimitConfig
+var rateLimitMutex sync.RWMutex
+var requestCounts = make(map[string]*RequestCounter) // IP -> 计数器
+var requestCountsMutex sync.RWMutex
+
+// RateLimitConfig 限流配置
+type RateLimitConfig struct {
+	Enabled        bool `json:"enabled"`
+	RequestsPerMin int  `json:"requestsPerMin"` // 每分钟最大请求数
+}
+
+// RequestCounter 请求计数器（滑动窗口）
+type RequestCounter struct {
+	Count     int
+	WindowEnd int64 // 窗口结束时间戳
+}
+
 // ========== 全局 Token 统计 ==========
 var tokenStatsFile = "token-stats.json"
 var tokenStats TokenStats
@@ -359,6 +378,105 @@ func handleUpdateIpBlacklist(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "IP 黑名单已更新", "count": len(ipBlacklist), "hash": newHash})
 }
 
+// loadRateLimitConfig 加载限流配置
+func loadRateLimitConfig() {
+	data, err := os.ReadFile(rateLimitFile)
+	if err != nil {
+		rateLimitConfig = RateLimitConfig{Enabled: false, RequestsPerMin: 60}
+		return
+	}
+	if err := json.Unmarshal(data, &rateLimitConfig); err != nil {
+		rateLimitConfig = RateLimitConfig{Enabled: false, RequestsPerMin: 60}
+		return
+	}
+	fmt.Printf("⏱️ 限流配置: enabled=%v, %d/min\n", rateLimitConfig.Enabled, rateLimitConfig.RequestsPerMin)
+}
+
+// saveRateLimitConfig 保存限流配置
+func saveRateLimitConfig() error {
+	data, err := json.MarshalIndent(rateLimitConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(rateLimitFile, data, 0644)
+}
+
+// rateLimitMiddleware 限流中间件（仅对 /v1/* 生效）
+func rateLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		rateLimitMutex.RLock()
+		enabled := rateLimitConfig.Enabled
+		limit := rateLimitConfig.RequestsPerMin
+		rateLimitMutex.RUnlock()
+
+		if !enabled || limit <= 0 {
+			c.Next()
+			return
+		}
+
+		clientIP := c.ClientIP()
+		now := time.Now().Unix()
+
+		requestCountsMutex.Lock()
+		counter, exists := requestCounts[clientIP]
+		if !exists || now >= counter.WindowEnd {
+			// 新窗口
+			requestCounts[clientIP] = &RequestCounter{Count: 1, WindowEnd: now + 60}
+			requestCountsMutex.Unlock()
+			c.Next()
+			return
+		}
+
+		counter.Count++
+		if counter.Count > limit {
+			requestCountsMutex.Unlock()
+			c.JSON(500, gin.H{
+				"error": map[string]any{
+					"message": "Rate limit exceeded",
+					"type":    "rate_limit_error",
+				},
+			})
+			c.Abort()
+			return
+		}
+		requestCountsMutex.Unlock()
+		c.Next()
+	}
+}
+
+// handleGetRateLimit 获取限流配置
+func handleGetRateLimit(c *gin.Context) {
+	rateLimitMutex.RLock()
+	cfg := rateLimitConfig
+	rateLimitMutex.RUnlock()
+	c.JSON(200, gin.H{"enabled": cfg.Enabled, "requestsPerMin": cfg.RequestsPerMin})
+}
+
+// handleUpdateRateLimit 更新限流配置
+func handleUpdateRateLimit(c *gin.Context) {
+	var req struct {
+		Enabled        bool `json:"enabled"`
+		RequestsPerMin int  `json:"requestsPerMin"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	rateLimitMutex.Lock()
+	rateLimitConfig.Enabled = req.Enabled
+	if req.RequestsPerMin > 0 {
+		rateLimitConfig.RequestsPerMin = req.RequestsPerMin
+	}
+	rateLimitMutex.Unlock()
+
+	if err := saveRateLimitConfig(); err != nil {
+		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"message": "限流配置已更新"})
+}
+
 // apiKeyAuthMiddleware API-KEY 验证中间件
 // 支持两种格式：
 // 1. Claude 格式: X-API-Key: sk-xxx
@@ -511,6 +629,9 @@ func main() {
 	// 加载 IP 黑名单
 	loadIpBlacklist()
 
+	// 加载限流配置
+	loadRateLimitConfig()
+
 	// 加载 Token 统计数据并启动后台写入协程
 	loadTokenStats()
 	go tokenStatsWorker()
@@ -577,6 +698,10 @@ func main() {
 		api.GET("/settings/ip-blacklist", handleGetIpBlacklist)
 		api.POST("/settings/ip-blacklist", handleUpdateIpBlacklist)
 
+		// 限流配置
+		api.GET("/settings/rate-limit", handleGetRateLimit)
+		api.POST("/settings/rate-limit", handleUpdateRateLimit)
+
 		// Token 统计
 		api.GET("/stats", handleGetStats)
 
@@ -591,14 +716,14 @@ func main() {
 		api.POST("/tools/call", handleToolsCall)
 	}
 
-	// OpenAI 格式接口（兼容）- 需要 API-KEY 验证
-	r.POST("/v1/chat/completions", apiKeyAuthMiddleware(), handleOpenAIChat)
+	// OpenAI 格式接口（兼容）- 需要 API-KEY 验证 + 限流
+	r.POST("/v1/chat/completions", rateLimitMiddleware(), apiKeyAuthMiddleware(), handleOpenAIChat)
 
-	// Claude 格式接口（兼容）- 需要 API-KEY 验证
-	r.POST("/v1/messages", apiKeyAuthMiddleware(), handleClaudeChat)
+	// Claude 格式接口（兼容）- 需要 API-KEY 验证 + 限流
+	r.POST("/v1/messages", rateLimitMiddleware(), apiKeyAuthMiddleware(), handleClaudeChat)
 
-	// Anthropic 原生格式接口（兼容）- 需要 API-KEY 验证
-	r.POST("/anthropic/v1/messages", apiKeyAuthMiddleware(), handleClaudeChat)
+	// Anthropic 原生格式接口（兼容）- 需要 API-KEY 验证 + 限流
+	r.POST("/anthropic/v1/messages", rateLimitMiddleware(), apiKeyAuthMiddleware(), handleClaudeChat)
 
 	// 从环境变量读取端口，默认 8080
 	port := os.Getenv("PORT")
