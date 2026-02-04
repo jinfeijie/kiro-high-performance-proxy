@@ -140,6 +140,7 @@ var requestCountsMutex sync.RWMutex
 type RateLimitConfig struct {
 	Enabled        bool `json:"enabled"`
 	RequestsPerMin int  `json:"requestsPerMin"` // 每分钟最大请求数
+	PenaltySeconds int  `json:"penaltySeconds"` // 超限惩罚延迟秒数
 }
 
 // RequestCounter 请求计数器（滑动窗口）
@@ -153,6 +154,22 @@ var tokenStatsFile = "token-stats.json"
 var tokenStats TokenStats
 var tokenStatsMutex sync.RWMutex
 var tokenStatsChan = make(chan TokenDelta, 1000) // 异步写入通道
+
+// ========== 账号调用统计 ==========
+var accountStatsFile = "account-stats.json"
+var accountStats = make(map[string]*AccountStats) // accountID -> 统计
+var accountStatsMutex sync.RWMutex
+
+// AccountStats 单个账号的统计数据
+type AccountStats struct {
+	AccountID    string           `json:"accountId"`
+	RequestCount int64            `json:"requestCount"`
+	SuccessCount int64            `json:"successCount"`
+	FailCount    int64            `json:"failCount"`
+	StatusCodes  map[int]int64    `json:"statusCodes"` // 状态码 -> 次数
+	Errors       map[string]int64 `json:"errors"`      // 错误类型 -> 次数
+	UpdatedAt    int64            `json:"updatedAt"`
+}
 
 // TokenStats 全局统计数据
 type TokenStats struct {
@@ -230,6 +247,131 @@ func getTokenStats() TokenStats {
 	tokenStatsMutex.RLock()
 	defer tokenStatsMutex.RUnlock()
 	return tokenStats
+}
+
+// ========== 账号统计函数 ==========
+
+// loadAccountStats 启动时加载账号统计数据
+func loadAccountStats() {
+	data, err := os.ReadFile(accountStatsFile)
+	if err != nil {
+		fmt.Println("📊 账号统计: 新建")
+		return
+	}
+	var stats map[string]*AccountStats
+	if err := json.Unmarshal(data, &stats); err != nil {
+		return
+	}
+	accountStatsMutex.Lock()
+	accountStats = stats
+	accountStatsMutex.Unlock()
+	fmt.Printf("📊 账号统计: 已加载 %d 个账号\n", len(stats))
+}
+
+// saveAccountStats 保存账号统计数据
+func saveAccountStats() {
+	accountStatsMutex.RLock()
+	data, _ := json.MarshalIndent(accountStats, "", "  ")
+	accountStatsMutex.RUnlock()
+	os.WriteFile(accountStatsFile, data, 0644)
+}
+
+// recordAccountRequest 记录账号请求（状态码和错误）
+func recordAccountRequest(accountID string, statusCode int, errMsg string) {
+	if accountID == "" {
+		return
+	}
+
+	accountStatsMutex.Lock()
+	defer accountStatsMutex.Unlock()
+
+	stats, exists := accountStats[accountID]
+	if !exists {
+		stats = &AccountStats{
+			AccountID:   accountID,
+			StatusCodes: make(map[int]int64),
+			Errors:      make(map[string]int64),
+		}
+		accountStats[accountID] = stats
+	}
+
+	stats.RequestCount++
+	stats.UpdatedAt = time.Now().Unix()
+
+	// 记录状态码
+	if stats.StatusCodes == nil {
+		stats.StatusCodes = make(map[int]int64)
+	}
+	stats.StatusCodes[statusCode]++
+
+	// 成功/失败计数
+	if statusCode >= 200 && statusCode < 300 {
+		stats.SuccessCount++
+	} else {
+		stats.FailCount++
+		// 记录错误类型
+		if errMsg != "" {
+			if stats.Errors == nil {
+				stats.Errors = make(map[string]int64)
+			}
+			stats.Errors[errMsg]++
+		}
+	}
+}
+
+// getAccountStats 获取所有账号统计
+func getAccountStats() map[string]*AccountStats {
+	accountStatsMutex.RLock()
+	defer accountStatsMutex.RUnlock()
+	// 返回副本
+	result := make(map[string]*AccountStats)
+	for k, v := range accountStats {
+		result[k] = v
+	}
+	return result
+}
+
+// handleGetAccountStats 获取账号统计 API
+func handleGetAccountStats(c *gin.Context) {
+	stats := getAccountStats()
+
+	// 计算总请求数
+	var totalRequests int64
+	for _, s := range stats {
+		totalRequests += s.RequestCount
+	}
+
+	// 构建响应数据
+	accounts := make([]map[string]any, 0)
+	for id, s := range stats {
+		percent := float64(0)
+		if totalRequests > 0 {
+			percent = float64(s.RequestCount) / float64(totalRequests) * 100
+		}
+		accounts = append(accounts, map[string]any{
+			"accountId":    id,
+			"requestCount": s.RequestCount,
+			"successCount": s.SuccessCount,
+			"failCount":    s.FailCount,
+			"percent":      percent,
+			"statusCodes":  s.StatusCodes,
+			"errors":       s.Errors,
+			"updatedAt":    s.UpdatedAt,
+		})
+	}
+
+	c.JSON(200, gin.H{
+		"accounts":      accounts,
+		"totalRequests": totalRequests,
+	})
+}
+
+// accountStatsWorker 后台协程定期保存账号统计
+func accountStatsWorker() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		saveAccountStats()
+	}
 }
 
 // handleGetStats 获取全局 Token 统计
@@ -407,6 +549,7 @@ func rateLimitMiddleware() gin.HandlerFunc {
 		rateLimitMutex.RLock()
 		enabled := rateLimitConfig.Enabled
 		limit := rateLimitConfig.RequestsPerMin
+		penalty := rateLimitConfig.PenaltySeconds
 		rateLimitMutex.RUnlock()
 
 		if !enabled || limit <= 0 {
@@ -430,6 +573,10 @@ func rateLimitMiddleware() gin.HandlerFunc {
 		counter.Count++
 		if counter.Count > limit {
 			requestCountsMutex.Unlock()
+			// 惩罚延迟
+			if penalty > 0 {
+				time.Sleep(time.Duration(penalty) * time.Second)
+			}
 			c.JSON(500, gin.H{
 				"error": map[string]any{
 					"message": "Rate limit exceeded",
@@ -449,7 +596,11 @@ func handleGetRateLimit(c *gin.Context) {
 	rateLimitMutex.RLock()
 	cfg := rateLimitConfig
 	rateLimitMutex.RUnlock()
-	c.JSON(200, gin.H{"enabled": cfg.Enabled, "requestsPerMin": cfg.RequestsPerMin})
+	c.JSON(200, gin.H{
+		"enabled":        cfg.Enabled,
+		"requestsPerMin": cfg.RequestsPerMin,
+		"penaltySeconds": cfg.PenaltySeconds,
+	})
 }
 
 // handleUpdateRateLimit 更新限流配置
@@ -457,6 +608,7 @@ func handleUpdateRateLimit(c *gin.Context) {
 	var req struct {
 		Enabled        bool `json:"enabled"`
 		RequestsPerMin int  `json:"requestsPerMin"`
+		PenaltySeconds int  `json:"penaltySeconds"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -467,6 +619,9 @@ func handleUpdateRateLimit(c *gin.Context) {
 	rateLimitConfig.Enabled = req.Enabled
 	if req.RequestsPerMin > 0 {
 		rateLimitConfig.RequestsPerMin = req.RequestsPerMin
+	}
+	if req.PenaltySeconds >= 0 {
+		rateLimitConfig.PenaltySeconds = req.PenaltySeconds
 	}
 	rateLimitMutex.Unlock()
 
@@ -636,6 +791,10 @@ func main() {
 	loadTokenStats()
 	go tokenStatsWorker()
 
+	// 加载账号统计数据并启动后台写入协程
+	loadAccountStats()
+	go accountStatsWorker()
+
 	// 启动保活机制（后台自动刷新所有账号的 Token）
 	client.Auth.StartKeepAlive()
 	fmt.Println("🔄 保活机制已启动（每5分钟检查一次）")
@@ -704,6 +863,9 @@ func main() {
 
 		// Token 统计
 		api.GET("/stats", handleGetStats)
+
+		// 账号统计
+		api.GET("/stats/accounts", handleGetAccountStats)
 
 		// Chat 接口
 		api.POST("/chat", handleChat)
@@ -1275,8 +1437,15 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 	})
 
 	if err != nil {
+		// 记录账号请求失败
+		accountID := client.Auth.GetLastSelectedAccountID()
+		recordAccountRequest(accountID, 500, err.Error())
 		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
+	} else {
+		// 记录账号请求成功
+		accountID := client.Auth.GetLastSelectedAccountID()
+		recordAccountRequest(accountID, 200, "")
 	}
 }
 
@@ -1287,9 +1456,16 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 
 	response, err := client.Chat.ChatWithModel(messages, model)
 	if err != nil {
+		// 记录账号请求失败
+		accountID := client.Auth.GetLastSelectedAccountID()
+		recordAccountRequest(accountID, 500, err.Error())
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+
+	// 记录账号请求成功
+	accountID := client.Auth.GetLastSelectedAccountID()
+	recordAccountRequest(accountID, 200, "")
 
 	// 计算输出 token 数
 	outputTokens := kiroclient.CountTokens(response)

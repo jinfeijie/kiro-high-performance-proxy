@@ -47,6 +47,9 @@ type AuthManager struct {
 	// ========== 保活相关 ==========
 	keepAliveStop chan struct{}
 	keepAliveWg   sync.WaitGroup
+
+	// ========== 账号追踪 ==========
+	lastSelectedAccountID string // 上一次选中的账号ID（用于统计）
 }
 
 // NewAuthManager 创建 AuthManager
@@ -446,6 +449,8 @@ func (m *AuthManager) selectAccount() (*AccountInfo, error) {
 	// 步骤3: 被选中的 currentWeight -= totalWeight
 	if selected != nil {
 		m.smoothWeights[selected.account.ID] -= totalWeight
+		// 保存选中的账号ID（用于统计追踪）
+		m.lastSelectedAccountID = selected.account.ID
 	}
 
 	// 调试日志
@@ -673,45 +678,9 @@ func (m *AuthManager) GetCurrentAccountInfo() (userId string, accountID string) 
 // GetLastSelectedAccountID 获取上一次选中的账号ID（不递增计数器）
 // 用于在请求完成后获取实际使用的账号信息
 func (m *AuthManager) GetLastSelectedAccountID() string {
-	config := m.getAccountsFromCache()
-	if config == nil || len(config.Accounts) == 0 {
-		return ""
-	}
-
-	// 使用当前索引（不递增）计算上一次选中的账号
-	// 因为 selectAccount 已经递增过了，所以用当前值
-	idx := int(m.roundRobinIndex) % len(config.Accounts)
-
-	// 找到可用账号列表
-	var candidates []*AccountInfo
-	for i := range config.Accounts {
-		acc := &config.Accounts[i]
-		if acc.Token == nil || acc.Token.IsExpired() {
-			continue
-		}
-		if !m.isAccountAvailable(acc.ID) {
-			continue
-		}
-		cache := m.getUsageCache(acc.ID)
-		if cache != nil && cache.GetRemainingCredits() <= 0 {
-			continue
-		}
-		candidates = append(candidates, acc)
-	}
-
-	if len(candidates) == 0 {
-		return ""
-	}
-
-	// 返回上一次选中的账号（索引-1，因为已经递增过了）
-	prevIdx := idx
-	if prevIdx < 0 {
-		prevIdx = len(candidates) - 1
-	}
-	if prevIdx >= len(candidates) {
-		prevIdx = prevIdx % len(candidates)
-	}
-	return candidates[prevIdx].ID
+	m.usageMu.RLock()
+	defer m.usageMu.RUnlock()
+	return m.lastSelectedAccountID
 }
 
 // RecordRequestResult 记录请求结果（用于熔断器）

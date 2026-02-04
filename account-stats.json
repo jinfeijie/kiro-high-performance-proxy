@@ -1,0 +1,68 @@
+{
+  "22e24ba72c7cb78f": {
+    "accountId": "22e24ba72c7cb78f",
+    "requestCount": 1,
+    "successCount": 1,
+    "failCount": 0,
+    "statusCodes": {
+      "200": 1
+    },
+    "errors": {},
+    "updatedAt": 1770217573
+  },
+  "671511701c243958": {
+    "accountId": "671511701c243958",
+    "requestCount": 2,
+    "successCount": 2,
+    "failCount": 0,
+    "statusCodes": {
+      "200": 2
+    },
+    "errors": {},
+    "updatedAt": 1770217613
+  },
+  "c8a569c4390cba49": {
+    "accountId": "c8a569c4390cba49",
+    "requestCount": 1,
+    "successCount": 1,
+    "failCount": 0,
+    "statusCodes": {
+      "200": 1
+    },
+    "errors": {},
+    "updatedAt": 1770217608
+  },
+  "dd7dbb710df8339e": {
+    "accountId": "dd7dbb710df8339e",
+    "requestCount": 1,
+    "successCount": 1,
+    "failCount": 0,
+    "statusCodes": {
+      "200": 1
+    },
+    "errors": {},
+    "updatedAt": 1770217594
+  },
+  "f0a4585ef2e742c0": {
+    "accountId": "f0a4585ef2e742c0",
+    "requestCount": 2,
+    "successCount": 2,
+    "failCount": 0,
+    "statusCodes": {
+      "200": 2
+    },
+    "errors": {},
+    "updatedAt": 1770217616
+  },
+  "fbdf1fa169462c28": {
+    "accountId": "fbdf1fa169462c28",
+    "requestCount": 1,
+    "successCount": 1,
+    "failCount": 0,
+    "statusCodes": {
+      "200": 1
+    },
+    "errors": {},
+    "updatedAt": 1770217599
+  }
+}
