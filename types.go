@@ -470,6 +470,19 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// ========== Kiro API Usage 相关类型（从 EventStream 解析）==========
+
+// KiroUsage Kiro API 返回的精确 token 使用量
+// 从 messageMetadataEvent 和 meteringEvent 解析
+type KiroUsage struct {
+	InputTokens      int     `json:"inputTokens"`      // 输入 token 数
+	OutputTokens     int     `json:"outputTokens"`     // 输出 token 数
+	CacheReadTokens  int     `json:"cacheReadTokens"`  // 缓存读取 token 数
+	CacheWriteTokens int     `json:"cacheWriteTokens"` // 缓存写入 token 数
+	ReasoningTokens  int     `json:"reasoningTokens"`  // 推理 token 数
+	Credits          float64 `json:"credits"`          // 消耗的 credits
+}
+
 // ========== MCP 工具调用相关类型 ==========
 
 // KiroToolWrapper Kiro API 工具包装器

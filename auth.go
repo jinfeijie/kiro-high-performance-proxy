@@ -91,7 +91,7 @@ func (m *AuthManager) InitAccountsCache() error {
 
 	m.accountsCache = config
 	m.accountsLoaded = true
-	fmt.Printf("[缓存] 已加载 %d 个账号到内存\n", len(config.Accounts))
+	// 线上环境已禁用调试日志
 
 	// 异步初始化额度缓存（不阻塞启动）
 	go m.refreshAllUsageCache()
@@ -114,7 +114,6 @@ func (m *AuthManager) refreshAllUsageCache() {
 
 		usage, err := m.GetUsageLimitsWithToken(acc.Token.AccessToken, acc.Token.Region, acc.ProfileArn)
 		if err != nil {
-			fmt.Printf("[额度缓存] 账号 %s 获取失败: %v\n", acc.ID[:8], err)
 			continue
 		}
 
@@ -122,7 +121,6 @@ func (m *AuthManager) refreshAllUsageCache() {
 		for _, u := range usage.UsageBreakdownList {
 			if u.ResourceType == "CREDIT" {
 				m.updateUsageCache(acc.ID, u.CurrentUsageWithPrecision, u.UsageLimitWithPrecision)
-				fmt.Printf("[额度缓存] 账号 %s: %.2f/%.2f\n", acc.ID[:8], u.CurrentUsageWithPrecision, u.UsageLimitWithPrecision)
 				break
 			}
 		}
@@ -226,7 +224,6 @@ func (m *AuthManager) recordSuccess(accountID string) {
 			cb.State = CircuitClosed
 			cb.FailureCount = 0
 			cb.SuccessCount = 0
-			fmt.Printf("[熔断器] 账号 %s 恢复正常\n", accountID)
 		}
 	case CircuitClosed:
 		// 正常状态下成功，重置失败计数
@@ -261,7 +258,6 @@ func (m *AuthManager) recordFailure(accountID string) {
 		if cb.FailureCount >= m.circuitConfig.FailureThreshold {
 			cb.State = CircuitOpen
 			cb.OpenedAt = now
-			fmt.Printf("[熔断器] 账号 %s 触发熔断（失败 %d 次）\n", accountID, cb.FailureCount)
 		}
 
 	case CircuitHalfOpen:
@@ -269,7 +265,6 @@ func (m *AuthManager) recordFailure(accountID string) {
 		cb.State = CircuitOpen
 		cb.OpenedAt = now
 		cb.SuccessCount = 0
-		fmt.Printf("[熔断器] 账号 %s 半开状态失败，重新熔断\n", accountID)
 	}
 }
 
@@ -295,7 +290,6 @@ func (m *AuthManager) isAccountAvailable(accountID string) bool {
 			cb.State = CircuitHalfOpen
 			cb.HalfOpenAt = now
 			cb.SuccessCount = 0
-			fmt.Printf("[熔断器] 账号 %s 进入半开状态\n", accountID)
 			return true
 		}
 		return false
@@ -413,7 +407,6 @@ func (m *AuthManager) selectAccount() (*AccountInfo, error) {
 
 	// 只有一个候选，直接返回
 	if len(candidates) == 1 {
-		fmt.Printf("[轮询] 仅1个可用账号: %s\n", candidates[0].account.ID[:8])
 		return candidates[0].account, nil
 	}
 
@@ -452,13 +445,6 @@ func (m *AuthManager) selectAccount() (*AccountInfo, error) {
 		// 保存选中的账号ID（用于统计追踪）
 		m.lastSelectedAccountID = selected.account.ID
 	}
-
-	// 调试日志
-	fmt.Printf("[轮询] 平滑加权: ")
-	for _, wa := range candidates {
-		fmt.Printf("%s(w=%d,c=%d) ", wa.account.ID[:8], wa.weight, m.smoothWeights[wa.account.ID])
-	}
-	fmt.Printf("-> 选中: %s\n", selected.account.ID[:8])
 
 	return selected.account, nil
 }
@@ -892,7 +878,6 @@ func (m *AuthManager) InitAllProfileArns() (int, int, error) {
 
 		profileArn, err := m.ListAvailableProfiles(acc.Token.AccessToken, region)
 		if err != nil {
-			fmt.Printf("[初始化] 账号 %s 获取 profileArn 失败: %v\n", acc.ID, err)
 			failCount++
 			continue
 		}
@@ -900,7 +885,6 @@ func (m *AuthManager) InitAllProfileArns() (int, int, error) {
 		acc.ProfileArn = profileArn
 		updated = true
 		successCount++
-		fmt.Printf("[初始化] 账号 %s profileArn: %s\n", acc.ID, profileArn)
 	}
 
 	// 保存更新后的配置
@@ -1438,11 +1422,8 @@ func (m *AuthManager) CompleteLogin(session *LoginSession) (*AccountInfo, error)
 
 	// 获取 profileArn（登录后自动获取）
 	profileArn, err := m.ListAvailableProfiles(token.AccessToken, session.Region)
-	if err != nil {
-		fmt.Printf("[登录] 获取 profileArn 失败: %v\n", err)
-	} else {
+	if err == nil {
 		account.ProfileArn = profileArn
-		fmt.Printf("[登录] 获取 profileArn 成功: %s\n", profileArn)
 	}
 
 	// 获取用户信息（userId）- 需要 profileArn
@@ -1726,13 +1707,7 @@ func (m *AuthManager) RefreshAllAccounts() {
 		}
 
 		// 使用该账号自己的 ClientID/ClientSecret 刷新
-		err := m.RefreshAccountToken(acc.ID)
-		if err != nil {
-			// 刷新失败，记录日志但继续处理其他账号
-			fmt.Printf("[保活] 账号 %s 刷新失败: %v\n", acc.ID, err)
-		} else {
-			fmt.Printf("[保活] 账号 %s Token 已刷新\n", acc.ID)
-		}
+		_ = m.RefreshAccountToken(acc.ID)
 	}
 }
 
@@ -1817,11 +1792,8 @@ func (m *AuthManager) ImportAccount(tokenJSON, clientRegJSON string) (*AccountIn
 		region = "us-east-1"
 	}
 	profileArn, err := m.ListAvailableProfiles(token.AccessToken, region)
-	if err != nil {
-		fmt.Printf("[导入] 获取 profileArn 失败: %v\n", err)
-	} else {
+	if err == nil {
 		account.ProfileArn = profileArn
-		fmt.Printf("[导入] 获取 profileArn 成功: %s\n", profileArn)
 	}
 
 	// 尝试获取用户信息（需要 profileArn）

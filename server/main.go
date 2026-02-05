@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -25,6 +27,7 @@ func computeHash(data []byte) string {
 }
 
 // generateID 生成唯一 ID（时间戳 + 随机数，避免并发冲突）
+// 格式：prefix_timestamp_randomhex，如 msg_1770269464010833000_02a2633eb6b49c97
 func generateID(prefix string) string {
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -52,6 +55,7 @@ type ClaudeChatRequest struct {
 	TopK          int              `json:"top_k,omitempty"`
 	StopSequences []string         `json:"stop_sequences,omitempty"`
 	Metadata      any              `json:"metadata,omitempty"`
+	OutputConfig  any              `json:"output_config,omitempty"`
 }
 
 // OpenAI 格式响应（完整版，对齐 new-api）
@@ -132,6 +136,9 @@ var modelMappingFile = "model-mapping.json"
 var apiKeysFile = "api-keys.json"
 var apiKeys []string // API-KEY 列表（支持 Claude X-API-Key 和 OpenAI Bearer Token）
 
+// ========== 全局结构化日志记录器 ==========
+var logger *StructuredLogger
+
 // ========== IP 黑名单 ==========
 var ipBlacklistFile = "ip-blacklist.json"
 var ipBlacklist []string
@@ -199,14 +206,21 @@ func loadTokenStats() {
 	data, err := os.ReadFile(tokenStatsFile)
 	if err != nil {
 		tokenStats = TokenStats{}
-		fmt.Println("📊 Token 统计: 新建")
+		if logger != nil {
+			logger.Info("", "Token 统计: 新建", nil)
+		}
 		return
 	}
 	if err := json.Unmarshal(data, &tokenStats); err != nil {
 		tokenStats = TokenStats{}
 	}
-	fmt.Printf("📊 Token 统计: 已加载 (输入:%d 输出:%d 总计:%d)\n",
-		tokenStats.InputTokens, tokenStats.OutputTokens, tokenStats.TotalTokens)
+	if logger != nil {
+		logger.Info("", "Token 统计: 已加载", map[string]any{
+			"inputTokens":  tokenStats.InputTokens,
+			"outputTokens": tokenStats.OutputTokens,
+			"totalTokens":  tokenStats.TotalTokens,
+		})
+	}
 }
 
 // saveTokenStats 保存统计数据到文件
@@ -263,7 +277,9 @@ func getTokenStats() TokenStats {
 func loadAccountStats() {
 	data, err := os.ReadFile(accountStatsFile)
 	if err != nil {
-		fmt.Println("📊 账号统计: 新建")
+		if logger != nil {
+			logger.Info("", "账号统计: 新建", nil)
+		}
 		return
 	}
 	var stats map[string]*AccountStats
@@ -273,7 +289,11 @@ func loadAccountStats() {
 	accountStatsMutex.Lock()
 	accountStats = stats
 	accountStatsMutex.Unlock()
-	fmt.Printf("📊 账号统计: 已加载 %d 个账号\n", len(stats))
+	if logger != nil {
+		logger.Info("", "账号统计: 已加载", map[string]any{
+			"accountCount": len(stats),
+		})
+	}
 }
 
 // saveAccountStats 保存账号统计数据
@@ -407,7 +427,11 @@ func loadApiKeys() {
 		return
 	}
 	apiKeys = keys
-	fmt.Printf("✅ 已加载 %d 个 API-KEY\n", len(apiKeys))
+	if logger != nil {
+		logger.Info("", "已加载 API-KEY", map[string]any{
+			"count": len(apiKeys),
+		})
+	}
 }
 
 // saveApiKeys 保存 API-KEY 配置到文件
@@ -432,7 +456,11 @@ func loadIpBlacklist() {
 		return
 	}
 	ipBlacklist = list
-	fmt.Printf("🚫 已加载 %d 个黑名单 IP\n", len(ipBlacklist))
+	if logger != nil {
+		logger.Info("", "已加载黑名单 IP", map[string]any{
+			"count": len(ipBlacklist),
+		})
+	}
 }
 
 // saveIpBlacklist 保存 IP 黑名单到文件
@@ -519,6 +547,9 @@ func handleUpdateIpBlacklist(c *gin.Context) {
 
 	ipBlacklist = validIPs
 	if err := saveIpBlacklist(); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
 	}
@@ -539,7 +570,12 @@ func loadRateLimitConfig() {
 		rateLimitConfig = RateLimitConfig{Enabled: false, RequestsPerMin: 60}
 		return
 	}
-	fmt.Printf("⏱️ 限流配置: enabled=%v, %d/min\n", rateLimitConfig.Enabled, rateLimitConfig.RequestsPerMin)
+	if logger != nil {
+		logger.Info("", "限流配置已加载", map[string]any{
+			"enabled":        rateLimitConfig.Enabled,
+			"requestsPerMin": rateLimitConfig.RequestsPerMin,
+		})
+	}
 }
 
 // saveRateLimitConfig 保存限流配置
@@ -634,10 +670,58 @@ func handleUpdateRateLimit(c *gin.Context) {
 	rateLimitMutex.Unlock()
 
 	if err := saveRateLimitConfig(); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"message": "限流配置已更新"})
+}
+
+// handleGetLogLevel 获取日志级别配置
+func handleGetLogLevel(c *gin.Context) {
+	if logger == nil {
+		c.JSON(200, gin.H{
+			"level":     "INFO",
+			"levelName": "INFO",
+			"available": []string{"DEBUG", "INFO", "WARN", "ERROR"},
+		})
+		return
+	}
+	level := logger.GetLevel()
+	c.JSON(200, gin.H{
+		"level":     int(level),
+		"levelName": level.String(),
+		"available": []string{"DEBUG", "INFO", "WARN", "ERROR"},
+	})
+}
+
+// handleUpdateLogLevel 更新日志级别配置
+func handleUpdateLogLevel(c *gin.Context) {
+	var req struct {
+		Level string `json:"level"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Level == "" {
+		c.JSON(400, gin.H{"error": "level 不能为空"})
+		return
+	}
+
+	newLevel := ParseLogLevel(req.Level)
+	if logger != nil {
+		logger.SetLevel(newLevel)
+	}
+
+	c.JSON(200, gin.H{
+		"message":   "日志级别已更新",
+		"level":     int(newLevel),
+		"levelName": newLevel.String(),
+	})
 }
 
 // apiKeyAuthMiddleware API-KEY 验证中间件
@@ -758,6 +842,9 @@ func handleUpdateApiKeys(c *gin.Context) {
 
 	apiKeys = validKeys
 	if err := saveApiKeys(); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
 	}
@@ -773,14 +860,31 @@ var loginSessions = make(map[string]*kiroclient.LoginSession)
 var sessionMutex sync.RWMutex
 
 func main() {
+	// 初始化全局结构化日志记录器
+	var err error
+	logger, err = NewStructuredLogger("", 0)
+	if err != nil {
+		fmt.Printf("⚠️ 初始化日志记录器失败: %v\n", err)
+	} else {
+		logger.Info("", "日志系统初始化完成", map[string]any{
+			"output": "stdout",
+		})
+	}
+
 	// 初始化 Kiro 客户端
 	client = kiroclient.NewKiroClient()
 
 	// 初始化账号缓存（从文件加载到内存）
 	if err := client.Auth.InitAccountsCache(); err != nil {
-		fmt.Printf("⚠️ 初始化账号缓存失败: %v\n", err)
+		if logger != nil {
+			logger.Warn("", "初始化账号缓存失败", map[string]any{
+				"error": err.Error(),
+			})
+		}
 	} else {
-		fmt.Println("✅ 账号缓存初始化完成")
+		if logger != nil {
+			logger.Info("", "账号缓存初始化完成", nil)
+		}
 	}
 
 	// 加载模型映射配置
@@ -805,12 +909,21 @@ func main() {
 
 	// 启动保活机制（后台自动刷新所有账号的 Token）
 	client.Auth.StartKeepAlive()
-	fmt.Println("🔄 保活机制已启动（每5分钟检查一次）")
+	if logger != nil {
+		logger.Info("", "保活机制已启动", map[string]any{
+			"interval": "5分钟",
+		})
+	}
 
 	r := gin.Default()
 
 	// 注册 pprof 路由
 	pprof.Register(r)
+
+	// 注册请求追踪中间件（必须在其他中间件之前）
+	if logger != nil {
+		r.Use(TraceMiddleware(logger))
+	}
 
 	// CORS
 	r.Use(func(c *gin.Context) {
@@ -827,10 +940,15 @@ func main() {
 	// IP 黑名单中间件（全局生效）
 	r.Use(ipBlacklistMiddleware())
 
-	// 静态文件服务 - 从项目根目录运行时的路径
-	r.Static("/static", "./server/static")
+	// 静态文件服务 - 支持从 server 目录或项目根目录启动
+	staticPath := "./static"
+	if _, err := os.Stat(staticPath); os.IsNotExist(err) {
+		staticPath = "./server/static"
+	}
+	r.Static("/static", staticPath)
 	r.GET("/", func(c *gin.Context) {
-		c.File("./server/static/index.html")
+		indexPath := staticPath + "/index.html"
+		c.File(indexPath)
 	})
 
 	// API 路由组
@@ -869,6 +987,10 @@ func main() {
 		api.GET("/settings/rate-limit", handleGetRateLimit)
 		api.POST("/settings/rate-limit", handleUpdateRateLimit)
 
+		// 日志级别配置
+		api.GET("/settings/log-level", handleGetLogLevel)
+		api.POST("/settings/log-level", handleUpdateLogLevel)
+
 		// Token 统计
 		api.GET("/stats", handleGetStats)
 
@@ -892,6 +1014,14 @@ func main() {
 	// Claude 格式接口（兼容）- 需要 API-KEY 验证 + 限流
 	r.POST("/v1/messages", rateLimitMiddleware(), apiKeyAuthMiddleware(), handleClaudeChat)
 
+	// Claude Code token 计数端点（模拟响应）
+	r.POST("/v1/messages/count_tokens", apiKeyAuthMiddleware(), handleCountTokens)
+
+	// Claude Code 遥测端点（直接返回 200 OK）
+	r.POST("/api/event_logging/batch", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
 	// Anthropic 原生格式接口（兼容）- 需要 API-KEY 验证 + 限流
 	r.POST("/anthropic/v1/messages", rateLimitMiddleware(), apiKeyAuthMiddleware(), handleClaudeChat)
 
@@ -901,13 +1031,16 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Println("🚀 Kiro API Proxy 启动成功！")
-	fmt.Printf("📡 监听端口: %s\n", port)
-	fmt.Printf("🌐 Web 界面: http://localhost:%s\n", port)
-	fmt.Println("🔗 OpenAI 格式: POST /v1/chat/completions")
-	fmt.Println("🔗 Claude 格式: POST /v1/messages")
-	fmt.Println("🔗 Anthropic 格式: POST /anthropic/v1/messages")
-	fmt.Printf("🔧 pprof: http://localhost:%s/debug/pprof/\n", port)
+	if logger != nil {
+		logger.Info("", "Kiro API Proxy 启动成功", map[string]any{
+			"port":      port,
+			"webUI":     "http://localhost:" + port,
+			"openai":    "POST /v1/chat/completions",
+			"claude":    "POST /v1/messages",
+			"anthropic": "POST /anthropic/v1/messages",
+			"pprof":     "http://localhost:" + port + "/debug/pprof/",
+		})
+	}
 
 	r.Run(":" + port)
 }
@@ -938,7 +1071,11 @@ func handleTokenStatus(c *gin.Context) {
 	// 获取额度信息
 	usage, err := client.Auth.GetUsageLimits()
 	if err != nil {
-		fmt.Printf("获取额度信息失败: %v\n", err)
+		if logger != nil {
+			logger.Warn(GetMsgID(c), "获取额度信息失败", map[string]any{
+				"error": err.Error(),
+			})
+		}
 	} else if len(usage.UsageBreakdownList) > 0 {
 		// 查找 CREDIT 类型的额度
 		for _, item := range usage.UsageBreakdownList {
@@ -1028,6 +1165,10 @@ func handleChat(c *gin.Context) {
 
 		flusher, ok := c.Writer.(http.Flusher)
 		if !ok {
+			err := fmt.Errorf("streaming not supported")
+			if logger != nil {
+				RecordError(c, logger, err, "")
+			}
 			c.JSON(500, gin.H{"error": "Streaming not supported"})
 			return
 		}
@@ -1053,6 +1194,9 @@ func handleChat(c *gin.Context) {
 		// 非流式响应
 		response, err := client.Chat.ChatWithModel(req.Messages, req.Model)
 		if err != nil {
+			if logger != nil {
+				RecordError(c, logger, err, "")
+			}
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
@@ -1075,6 +1219,9 @@ func handleSearch(c *gin.Context) {
 
 	results, err := client.Search.Search(req.Query, req.MaxResults)
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -1086,6 +1233,9 @@ func handleSearch(c *gin.Context) {
 func handleToolsList(c *gin.Context) {
 	tools, err := client.MCP.ToolsList()
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -1107,6 +1257,9 @@ func handleToolsCall(c *gin.Context) {
 
 	content, err := client.MCP.ToolsCall(req.Name, req.Arguments)
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -1120,6 +1273,15 @@ func handleOpenAIChat(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
+	}
+
+	// 记录 OpenAI 格式请求输入
+	if logger != nil {
+		logger.Info(GetMsgID(c), "OpenAI 请求输入", map[string]any{
+			"model":    req.Model,
+			"stream":   req.Stream,
+			"msgCount": len(req.Messages),
+		})
 	}
 
 	// 应用模型映射（标准化模型ID）
@@ -1145,13 +1307,83 @@ func handleOpenAIChat(c *gin.Context) {
 	}
 }
 
+// CountTokensRequest token 计数请求
+type CountTokensRequest struct {
+	Model    string           `json:"model"`
+	Messages []map[string]any `json:"messages"`
+	System   any              `json:"system,omitempty"`
+}
+
+// handleCountTokens 处理 Claude Code token 计数请求（模拟响应）
+// 参考 Kiro-account-manager 实现：按 4 字符 ≈ 1 token 估算
+func handleCountTokens(c *gin.Context) {
+	var req CountTokensRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// 计算总字符数
+	totalChars := 0
+
+	// 遍历 messages
+	for _, msg := range req.Messages {
+		content := msg["content"]
+		switch v := content.(type) {
+		case string:
+			totalChars += len(v)
+		case []interface{}:
+			for _, part := range v {
+				if m, ok := part.(map[string]interface{}); ok {
+					if m["type"] == "text" {
+						if text, ok := m["text"].(string); ok {
+							totalChars += len(text)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 计算 system 字符数
+	if req.System != nil {
+		switch v := req.System.(type) {
+		case string:
+			totalChars += len(v)
+		default:
+			// 复杂格式序列化后计算
+			data, _ := json.Marshal(v)
+			totalChars += len(data)
+		}
+	}
+
+	// 估算 token 数（4 字符 ≈ 1 token）
+	estimatedTokens := (totalChars + 3) / 4
+	if estimatedTokens < 1 {
+		estimatedTokens = 1
+	}
+
+	c.JSON(200, gin.H{"input_tokens": estimatedTokens})
+}
+
 // handleClaudeChat 处理 Claude 格式请求
 func handleClaudeChat(c *gin.Context) {
+	// 调试：记录原始请求体
+	bodyBytes, _ := io.ReadAll(c.Request.Body)
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	if logger != nil {
+		logger.Debug(GetMsgID(c), "Claude 原始请求", map[string]any{
+			"body": string(bodyBytes),
+		})
+	}
+
 	var req ClaudeChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+
+	// Claude 请求输入日志已禁用（减少日志噪音）
 
 	// 应用模型映射（标准化模型ID）
 	if req.Model != "" {
@@ -1276,20 +1508,17 @@ func convertToKiroMessages(messages []map[string]any) []kiroclient.ChatMessage {
 }
 
 // convertToKiroMessagesWithSystem 转换消息格式（支持 system 和 tools）
-// 返回：messages, tools, toolResults
+// 返回：messages, tools, lastToolResults（只返回最后一条 user 消息的 toolResults）
+// 参考 Kiro-account-manager/translator.ts 的 claudeToKiro 实现
 func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tools any) ([]kiroclient.ChatMessage, []kiroclient.KiroToolWrapper, []kiroclient.KiroToolResult) {
 	var kiroMessages []kiroclient.ChatMessage
 	var kiroTools []kiroclient.KiroToolWrapper
-	var kiroToolResults []kiroclient.KiroToolResult
 
-	// 提取 system prompt
+	// 提取 system prompt（将合并到最后一条 user 消息）
 	systemPrompt := extractSystemPrompt(system)
 
 	// 转换 tools
 	kiroTools = convertClaudeTools(tools)
-
-	// 标记是否已合并 system prompt
-	systemMerged := false
 
 	for _, msg := range messages {
 		role, _ := msg["role"].(string)
@@ -1297,7 +1526,7 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 		var content string
 		var images []kiroclient.ImageBlock
 		var msgToolResults []kiroclient.KiroToolResult
-		var msgToolUses []kiroclient.KiroToolUse // 关键：提取 assistant 消息中的 tool_use
+		var msgToolUses []kiroclient.KiroToolUse
 
 		switch v := msg["content"].(type) {
 		case string:
@@ -1371,12 +1600,10 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 							Status:    "success",
 						}
 						msgToolResults = append(msgToolResults, tr)
-						kiroToolResults = append(kiroToolResults, tr)
 					}
 
 				case "tool_use":
-					// 关键修复：提取 assistant 消息中的 tool_use
-					// 这些需要放到 assistantResponseMessage.toolUses 中
+					// 提取 assistant 消息中的 tool_use
 					toolUseId, _ := m["id"].(string)
 					toolName, _ := m["name"].(string)
 					toolInput, _ := m["input"].(map[string]interface{})
@@ -1391,14 +1618,7 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 			}
 		}
 
-		// 第一条 user 消息合并 system prompt
-		if role == "user" && !systemMerged && systemPrompt != "" {
-			content = systemPrompt + "\n\n" + content
-			systemMerged = true
-		}
-
 		// 处理 user 消息中包含 tool_result 的情况
-		// 如果只有 tool_result 没有文本内容，添加占位内容
 		if role == "user" && len(msgToolResults) > 0 && content == "" {
 			content = "Here are the tool results."
 		}
@@ -1409,22 +1629,43 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 		}
 
 		kiroMessages = append(kiroMessages, kiroclient.ChatMessage{
-			Role:     role,
-			Content:  content,
-			Images:   images,
-			ToolUses: msgToolUses, // 关键：填充 assistant 消息的 toolUses
+			Role:        role,
+			Content:     content,
+			Images:      images,
+			ToolUses:    msgToolUses,
+			ToolResults: msgToolResults,
 		})
 	}
 
-	// 如果没有 user 消息但有 system prompt，创建一个
-	if !systemMerged && systemPrompt != "" && len(kiroMessages) == 0 {
+	// 将 system prompt 合并到最后一条 user 消息的 content 开头
+	if systemPrompt != "" && len(kiroMessages) > 0 {
+		for i := len(kiroMessages) - 1; i >= 0; i-- {
+			if kiroMessages[i].Role == "user" {
+				kiroMessages[i].Content = "--- SYSTEM PROMPT ---\n" + systemPrompt + "\n--- END SYSTEM PROMPT ---\n\n" + kiroMessages[i].Content
+				break
+			}
+		}
+	}
+
+	// 如果没有任何消息但有 system prompt，创建一条
+	if len(kiroMessages) == 0 && systemPrompt != "" {
 		kiroMessages = append(kiroMessages, kiroclient.ChatMessage{
 			Role:    "user",
-			Content: systemPrompt,
+			Content: "--- SYSTEM PROMPT ---\n" + systemPrompt + "\n--- END SYSTEM PROMPT ---\n\nContinue",
 		})
 	}
 
-	return kiroMessages, kiroTools, kiroToolResults
+	// 关键修复：只返回最后一条 user 消息的 toolResults
+	// 参考 TypeScript translator.ts: currentToolResults 只保存最后一条消息的 toolResults
+	var lastToolResults []kiroclient.KiroToolResult
+	if len(kiroMessages) > 0 {
+		lastMsg := kiroMessages[len(kiroMessages)-1]
+		if lastMsg.Role == "user" {
+			lastToolResults = lastMsg.ToolResults
+		}
+	}
+
+	return kiroMessages, kiroTools, lastToolResults
 }
 
 // extractSystemPrompt 提取 system prompt
@@ -1522,6 +1763,8 @@ func extractToolResultContent(content any) string {
 }
 
 // handleStreamResponse 处理流式响应
+// handleStreamResponse 处理流式响应
+// 使用 ChatStreamWithModelAndUsage 获取 Kiro API 返回的精确 token 使用量
 func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, format string, model string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -1529,17 +1772,23 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
+		err := fmt.Errorf("streaming not supported")
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": "Streaming not supported"})
 		return
 	}
 
-	// 计算输入 token 数
-	inputTokens := kiroclient.CountMessagesTokens(messages)
+	// 本地估算的 inputTokens（用于 message_start 事件，因为此时还没有 API 返回值）
+	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 	var outputBuilder strings.Builder
 	msgID := generateID("msg")
 	chatcmplID := generateID("chatcmpl")
+	// 保存估算的 outputTokens（用于 SSE 事件，因为回调中无法获取 usage）
+	var estimatedOutputTokens int
 
-	// Claude 格式：先发送 message_start 事件（包含 input_tokens）
+	// Claude 格式：先发送 message_start 事件（使用估算值）
 	if format == "claude" {
 		msgStart := map[string]any{
 			"type": "message_start",
@@ -1549,7 +1798,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				"role":  "assistant",
 				"model": model,
 				"usage": map[string]int{
-					"input_tokens":  inputTokens,
+					"input_tokens":  estimatedInputTokens,
 					"output_tokens": 0,
 				},
 			},
@@ -1571,13 +1820,14 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		flusher.Flush()
 	}
 
-	err := client.Chat.ChatStreamWithModel(messages, model, func(content string, done bool) {
+	// 使用 ChatStreamWithModelAndUsage 获取精确 usage
+	usage, err := client.Chat.ChatStreamWithModelAndUsage(messages, model, func(content string, done bool) {
 		if done {
-			// 计算输出 token 数
-			outputTokens := kiroclient.CountTokens(outputBuilder.String())
+			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
+			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
 			if format == "openai" {
-				// OpenAI 流式结束前发送带 usage 的 chunk
+				// OpenAI 流式结束前发送带 usage 的 chunk（使用估算值）
 				stopReason := "stop"
 				finalChunk := map[string]any{
 					"id":                 chatcmplID,
@@ -1594,17 +1844,17 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 						},
 					},
 					"usage": map[string]any{
-						"prompt_tokens":     inputTokens,
-						"completion_tokens": outputTokens,
-						"total_tokens":      inputTokens + outputTokens,
+						"prompt_tokens":     estimatedInputTokens,
+						"completion_tokens": estimatedOutputTokens,
+						"total_tokens":      estimatedInputTokens + estimatedOutputTokens,
 						"prompt_tokens_details": map[string]int{
 							"cached_tokens": 0,
-							"text_tokens":   inputTokens,
+							"text_tokens":   estimatedInputTokens,
 							"audio_tokens":  0,
 							"image_tokens":  0,
 						},
 						"completion_tokens_details": map[string]int{
-							"text_tokens":      outputTokens,
+							"text_tokens":      estimatedOutputTokens,
 							"audio_tokens":     0,
 							"reasoning_tokens": 0,
 						},
@@ -1622,7 +1872,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				data, _ := json.Marshal(blockStop)
 				fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
 
-				// 发送 message_delta 事件（包含 output_tokens）
+				// 发送 message_delta 事件（使用估算值）
 				msgDelta := map[string]any{
 					"type": "message_delta",
 					"delta": map[string]any{
@@ -1630,7 +1880,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 						"stop_sequence": nil,
 					},
 					"usage": map[string]int{
-						"output_tokens": outputTokens,
+						"output_tokens": estimatedOutputTokens,
 					},
 				}
 				data, _ = json.Marshal(msgDelta)
@@ -1643,8 +1893,6 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				data, _ = json.Marshal(msgStop)
 				fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
 			}
-			// 累加全局统计
-			addTokenStats(inputTokens, outputTokens)
 			flusher.Flush()
 			return
 		}
@@ -1694,38 +1942,96 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		// 记录账号请求失败
 		accountID := client.Auth.GetLastSelectedAccountID()
 		recordAccountRequest(accountID, 500, err.Error())
+		// 记录流式响应错误
+		if logger != nil {
+			logger.Error(GetMsgID(c), "流式响应失败", map[string]any{
+				"format":    format,
+				"model":     model,
+				"error":     err.Error(),
+				"accountId": accountID,
+			})
+		}
 		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
 	} else {
 		// 记录账号请求成功
 		accountID := client.Auth.GetLastSelectedAccountID()
 		recordAccountRequest(accountID, 200, "")
+
+		// 使用精确 usage（如果可用），否则降级使用估算值
+		inputTokens := estimatedInputTokens
+		outputTokens := estimatedOutputTokens
+		if usage != nil {
+			inputTokens = usage.InputTokens
+			outputTokens = usage.OutputTokens
+		}
+
+		// 累加全局统计（使用精确值）
+		addTokenStats(inputTokens, outputTokens)
+
+		// 流式响应完成日志已禁用（减少日志噪音）
 	}
 }
 
 // handleNonStreamResponse 处理非流式响应
+// handleNonStreamResponse 处理非流式响应
+// 使用 ChatStreamWithModelAndUsage 获取 Kiro API 返回的精确 token 使用量
 func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, format string, model string) {
-	// 计算输入 token 数
-	inputTokens := kiroclient.CountMessagesTokens(messages)
+	// 本地估算的 inputTokens（降级使用）
+	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 
-	response, err := client.Chat.ChatWithModel(messages, model)
+	// 收集完整响应
+	var responseBuilder strings.Builder
+
+	// 使用 ChatStreamWithModelAndUsage 获取精确 usage
+	usage, err := client.Chat.ChatStreamWithModelAndUsage(messages, model, func(content string, done bool) {
+		if !done {
+			responseBuilder.WriteString(content)
+		}
+	})
+
 	if err != nil {
 		// 记录账号请求失败
 		accountID := client.Auth.GetLastSelectedAccountID()
 		recordAccountRequest(accountID, 500, err.Error())
+		if logger != nil {
+			RecordError(c, logger, err, accountID)
+			logger.Error(GetMsgID(c), "非流式响应失败", map[string]any{
+				"format":    format,
+				"model":     model,
+				"error":     err.Error(),
+				"accountId": accountID,
+			})
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+
+	response := responseBuilder.String()
 
 	// 记录账号请求成功
 	accountID := client.Auth.GetLastSelectedAccountID()
 	recordAccountRequest(accountID, 200, "")
 
-	// 计算输出 token 数
+	// 使用精确 usage（如果可用），否则降级使用估算值
+	inputTokens := estimatedInputTokens
 	outputTokens := kiroclient.CountTokens(response)
+	cacheReadTokens := 0
+	cacheWriteTokens := 0
+	reasoningTokens := 0
+	if usage != nil {
+		inputTokens = usage.InputTokens
+		outputTokens = usage.OutputTokens
+		cacheReadTokens = usage.CacheReadTokens
+		cacheWriteTokens = usage.CacheWriteTokens
+		reasoningTokens = usage.ReasoningTokens
+	}
+
+	// 非流式响应完成日志已禁用（减少日志噪音）
 
 	if format == "openai" {
 		// OpenAI 格式响应（完整版，对齐 new-api）
+		// 使用精确 usage 填充 cache 和 reasoning 信息
 		resp := OpenAIChatResponse{
 			ID:                generateID("chatcmpl"),
 			Object:            "chat.completion",
@@ -1743,27 +2049,29 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 				},
 			},
 			Usage: &kiroclient.OpenAIUsage{
-				PromptTokens:     inputTokens,
-				CompletionTokens: outputTokens,
-				TotalTokens:      inputTokens + outputTokens,
+				PromptTokens:         inputTokens,
+				CompletionTokens:     outputTokens,
+				TotalTokens:          inputTokens + outputTokens,
+				PromptCacheHitTokens: cacheReadTokens,
 				PromptTokensDetails: kiroclient.InputTokenDetails{
-					CachedTokens: 0,
-					TextTokens:   inputTokens,
+					CachedTokens: cacheReadTokens,
+					TextTokens:   inputTokens - cacheReadTokens,
 					AudioTokens:  0,
 					ImageTokens:  0,
 				},
 				CompletionTokenDetails: kiroclient.OutputTokenDetails{
-					TextTokens:      outputTokens,
+					TextTokens:      outputTokens - reasoningTokens,
 					AudioTokens:     0,
-					ReasoningTokens: 0,
+					ReasoningTokens: reasoningTokens,
 				},
 			},
 		}
-		// 累加全局统计
+		// 累加全局统计（使用精确值）
 		addTokenStats(inputTokens, outputTokens)
 		c.JSON(200, resp)
 	} else {
 		// Claude 格式响应（完整版，对齐 new-api）
+		// 使用精确 usage 填充 cache 信息
 		resp := ClaudeChatResponse{
 			ID:         generateID("msg"),
 			Type:       "message",
@@ -1777,17 +2085,20 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 				},
 			},
 			Usage: &kiroclient.ClaudeUsage{
-				InputTokens:  inputTokens,
-				OutputTokens: outputTokens,
+				InputTokens:              inputTokens,
+				OutputTokens:             outputTokens,
+				CacheCreationInputTokens: cacheWriteTokens,
+				CacheReadInputTokens:     cacheReadTokens,
 			},
 		}
-		// 累加全局统计
+		// 累加全局统计（使用精确值）
 		addTokenStats(inputTokens, outputTokens)
 		c.JSON(200, resp)
 	}
 }
 
 // handleStreamResponseWithTools 处理流式响应（支持工具调用）
+// 使用 ChatStreamWithToolsAndUsage 获取 Kiro API 返回的精确 token 使用量
 func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -1795,16 +2106,21 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
+		err := fmt.Errorf("streaming not supported")
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": "Streaming not supported"})
 		return
 	}
 
-	inputTokens := kiroclient.CountMessagesTokens(messages)
+	// 本地估算的 inputTokens（用于 message_start 事件，因为此时还没有 API 返回值）
+	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 	var outputBuilder strings.Builder
 	msgID := generateID("msg")
 	contentBlockIndex := 0
 
-	// Claude 格式：发送 message_start 事件
+	// Claude 格式：发送 message_start 事件（使用估算值）
 	if format == "claude" {
 		msgStart := map[string]any{
 			"type": "message_start",
@@ -1814,7 +2130,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				"role":  "assistant",
 				"model": model,
 				"usage": map[string]int{
-					"input_tokens":  inputTokens,
+					"input_tokens":  estimatedInputTokens,
 					"output_tokens": 0,
 				},
 			},
@@ -1826,10 +2142,14 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 	// 标记是否已发送文本块开始
 	textBlockStarted := false
+	// 保存估算的 outputTokens（用于 message_delta 事件）
+	var estimatedOutputTokens int
 
-	err := client.Chat.ChatStreamWithTools(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
+	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
+	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
 		if done {
-			outputTokens := kiroclient.CountTokens(outputBuilder.String())
+			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
+			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
 			// 关闭文本块（如果已开始）
 			if textBlockStarted {
@@ -1854,7 +2174,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 					"stop_sequence": nil,
 				},
 				"usage": map[string]int{
-					"output_tokens": outputTokens,
+					"output_tokens": estimatedOutputTokens,
 				},
 			}
 			data, _ := json.Marshal(msgDelta)
@@ -1865,7 +2185,6 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			data, _ = json.Marshal(msgStop)
 			fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
 
-			addTokenStats(inputTokens, outputTokens)
 			flusher.Flush()
 			return
 		}
@@ -1960,22 +2279,48 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 	if err != nil {
 		accountID := client.Auth.GetLastSelectedAccountID()
 		recordAccountRequest(accountID, 500, err.Error())
+		// 记录流式响应（带工具）错误
+		if logger != nil {
+			logger.Error(GetMsgID(c), "流式响应(Tools)失败", map[string]any{
+				"format":     format,
+				"model":      model,
+				"toolsCount": len(tools),
+				"error":      err.Error(),
+				"accountId":  accountID,
+			})
+		}
 		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
 	} else {
 		accountID := client.Auth.GetLastSelectedAccountID()
 		recordAccountRequest(accountID, 200, "")
+
+		// 使用 Kiro API 返回的精确 usage 值（如果有），否则降级使用本地估算
+		inputTokens := estimatedInputTokens
+		outputTokens := estimatedOutputTokens
+		if usage != nil && usage.InputTokens > 0 {
+			inputTokens = usage.InputTokens
+			outputTokens = usage.OutputTokens
+		}
+
+		// 累加全局统计（使用精确值）
+		addTokenStats(inputTokens, outputTokens)
+
+		// 流式响应(Tools)完成日志已禁用（减少日志噪音）
 	}
 }
 
 // handleNonStreamResponseWithTools 处理非流式响应（支持工具调用）
+// 使用 ChatStreamWithToolsAndUsage 获取 Kiro API 返回的精确 token 使用量
 func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string) {
-	inputTokens := kiroclient.CountMessagesTokens(messages)
+	// 本地估算的 inputTokens（降级使用）
+	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 
 	var responseText strings.Builder
 	var toolUses []*kiroclient.KiroToolUse
 
-	err := client.Chat.ChatStreamWithTools(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
+	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
+	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
 		if content != "" {
 			responseText.WriteString(content)
 		}
@@ -1987,6 +2332,16 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	if err != nil {
 		accountID := client.Auth.GetLastSelectedAccountID()
 		recordAccountRequest(accountID, 500, err.Error())
+		if logger != nil {
+			RecordError(c, logger, err, accountID)
+			logger.Error(GetMsgID(c), "非流式响应(Tools)失败", map[string]any{
+				"format":     format,
+				"model":      model,
+				"toolsCount": len(tools),
+				"error":      err.Error(),
+				"accountId":  accountID,
+			})
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -1994,7 +2349,15 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	accountID := client.Auth.GetLastSelectedAccountID()
 	recordAccountRequest(accountID, 200, "")
 
+	// 使用 Kiro API 返回的精确 usage 值（如果有），否则降级使用本地估算
+	inputTokens := estimatedInputTokens
 	outputTokens := kiroclient.CountTokens(responseText.String())
+	if usage != nil && usage.InputTokens > 0 {
+		inputTokens = usage.InputTokens
+		outputTokens = usage.OutputTokens
+	}
+
+	// 非流式响应(Tools)完成日志已禁用（减少日志噪音）
 
 	// 构建 content 数组
 	var contentBlocks []map[string]any
@@ -2036,6 +2399,7 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 		},
 	}
 
+	// 累加全局统计（使用精确值）
 	addTokenStats(inputTokens, outputTokens)
 	c.JSON(200, resp)
 }
@@ -2122,6 +2486,9 @@ func handleUpdateModelMapping(c *gin.Context) {
 
 	// 保存到文件
 	if err := saveModelMapping(); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": fmt.Sprintf("保存映射配置失败: %s", err.Error())})
 		return
 	}
@@ -2147,6 +2514,9 @@ func handleStartLogin(c *gin.Context) {
 	// 开始登录流程
 	session, err := client.Auth.StartLogin(req.Region, req.StartUrl)
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -2184,6 +2554,9 @@ func handleImportAccount(c *gin.Context) {
 
 	account, err := client.Auth.ImportAccount(req.TokenJSON, req.ClientRegJSON)
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -2220,6 +2593,9 @@ func handlePollLogin(c *gin.Context) {
 	// 尝试完成登录
 	account, err := client.Auth.CompleteLogin(session)
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -2264,6 +2640,9 @@ type AccountWithUsage struct {
 func handleListAccounts(c *gin.Context) {
 	config, err := client.Auth.LoadAccountsConfig()
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -2290,7 +2669,12 @@ func handleListAccounts(c *gin.Context) {
 		if acc.Token != nil && acc.Token.AccessToken != "" {
 			usage, err := client.Auth.GetUsageLimitsWithToken(acc.Token.AccessToken, acc.Token.Region, acc.ProfileArn)
 			if err != nil {
-				fmt.Printf("[账号 %s] 获取额度失败: %v\n", acc.ID, err)
+				if logger != nil {
+					logger.Warn(GetMsgID(c), "账号获取额度失败", map[string]any{
+						"accountId": acc.ID,
+						"error":     err.Error(),
+					})
+				}
 			} else if len(usage.UsageBreakdownList) > 0 {
 				for _, u := range usage.UsageBreakdownList {
 					if u.ResourceType == "CREDIT" {
@@ -2335,6 +2719,9 @@ func handleDeleteAccount(c *gin.Context) {
 	accountID := c.Param("id")
 
 	if err := client.Auth.DeleteAccount(accountID); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, accountID)
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -2347,6 +2734,9 @@ func handleRefreshAccount(c *gin.Context) {
 	accountID := c.Param("id")
 
 	if err := client.Auth.RefreshAccountToken(accountID); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, accountID)
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -2409,6 +2799,9 @@ func handleAccountDetail(c *gin.Context) {
 
 	config, err := client.Auth.LoadAccountsConfig()
 	if err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, accountID)
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}

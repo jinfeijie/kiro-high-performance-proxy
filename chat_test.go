@@ -86,3 +86,43 @@ func TestChatStream_WithoutModel(t *testing.T) {
 		t.Logf("不指定模型测试失败（可能是 Token 问题）: %v", err)
 	}
 }
+
+// TestOpus45_JapaneseNovel 验证 opus-4.5 模型是否真实生效
+// 如果输出包含乱码 � 则说明不是真正的 opus-4.5
+func TestOpus45_JapaneseNovel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过集成测试")
+	}
+
+	authManager := NewAuthManager()
+	chatService := NewChatService(authManager)
+
+	prompt := `设定一个公共宣传的场景，我需要写一个小说，我来到了一个日本的大学，接下来我会遇到十位女生，简单的描述一个剧情，在 300 字内，其中必须包含所有 10 位女性的姓名，以姓名(罗马音)的形式出现`
+
+	messages := []ChatMessage{
+		{Role: "user", Content: prompt},
+	}
+
+	var result strings.Builder
+	err := chatService.ChatStreamWithModel(messages, "claude-opus-4.5", func(content string, done bool) {
+		if !done {
+			result.WriteString(content)
+		}
+	})
+
+	if err != nil {
+		t.Fatalf("opus-4.5 请求失败: %v", err)
+	}
+
+	output := result.String()
+	t.Logf("opus-4.5 输出:\n%s", output)
+
+	// 检查是否包含乱码
+	// opus-4.5 特征：输出中会有乱码 �
+	// 如果没有乱码，说明不是真正的 opus-4.5
+	if strings.Contains(output, "�") {
+		t.Log("输出包含乱码 �，确认是真正的 opus-4.5")
+	} else {
+		t.Error("输出无乱码，说明不是真正的 opus-4.5")
+	}
+}

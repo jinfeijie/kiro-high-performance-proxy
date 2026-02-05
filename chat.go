@@ -48,22 +48,28 @@ func generateConversationID() string {
 }
 
 // ChatStreamWithModel 流式聊天（支持指定模型）
+// 向后兼容版本，不返回 usage 信息
 func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, callback func(content string, done bool)) error {
+	_, err := s.ChatStreamWithModelAndUsage(messages, model, callback)
+	return err
+}
+
+// ChatStreamWithModelAndUsage 流式聊天（支持指定模型，返回精确 usage）
+// 返回 KiroUsage 包含从 Kiro API EventStream 解析的精确 token 使用量
+func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model string, callback func(content string, done bool)) (*KiroUsage, error) {
 	// 使用带账号ID的方法，便于熔断器追踪
 	token, accountID, err := s.authManager.GetAccessTokenWithAccountID()
 	if err != nil {
 		// 降级：使用旧方法
 		token, err = s.authManager.GetAccessToken()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		accountID = ""
 	}
 
 	// 打印使用的账号（用于调试轮询）
-	if accountID != "" {
-		fmt.Printf("[轮询] 使用账号: %s\n", accountID[:8])
-	}
+	// 线上环境已禁用调试日志
 
 	// 构建会话状态
 	conversationID := generateConversationID()
@@ -77,6 +83,7 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 			userMsg := map[string]any{
 				"content": msg.Content,
 				"origin":  "AI_EDITOR",
+				"modelId": model,
 			}
 			// 如果有图片，添加到消息中
 			if len(msg.Images) > 0 {
@@ -110,6 +117,7 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 		userMsg := map[string]any{
 			"content": lastMsg.Content,
 			"origin":  "AI_EDITOR",
+			"modelId": model,
 		}
 		// 如果有图片，添加到消息中
 		if len(lastMsg.Images) > 0 {
@@ -130,6 +138,8 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 	}
 
 	// 构建请求体
+	// 注意：customizationArn 需要 ARN 格式，简单模型 ID 不被接受
+	// Kiro API 会根据账号配置自动选择模型，暂不传递 customizationArn
 	reqBody := map[string]any{
 		"conversationState": map[string]any{
 			"conversationId":  conversationID,
@@ -139,15 +149,9 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 		},
 	}
 
-	// 添加 customizationArn（模型参数）
-	// 如果指定了模型且模型有效，则添加到请求体
-	if model != "" && IsValidModel(model) {
-		reqBody["customizationArn"] = model
-	}
-
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// 确定 endpoint
@@ -163,7 +167,7 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// 设置请求头
@@ -180,7 +184,7 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 	if err != nil {
 		// 记录请求失败（网络错误）
 		s.authManager.RecordRequestResult(accountID, false)
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -188,7 +192,7 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		// 记录请求失败（HTTP错误）
 		s.authManager.RecordRequestResult(accountID, false)
-		return fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	// 记录请求成功
@@ -199,20 +203,23 @@ func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, 
 }
 
 // parseEventStream 解析 EventStream
-func (s *ChatService) parseEventStream(body io.Reader, callback func(content string, done bool)) error {
+// 返回 KiroUsage 包含从 API 获取的精确 token 使用量
+func (s *ChatService) parseEventStream(body io.Reader, callback func(content string, done bool)) (*KiroUsage, error) {
+	usage := &KiroUsage{}
+
 	for {
 		msg, err := s.readEventStreamMessage(body)
 		if err != nil {
 			if err == io.EOF {
 				callback("", true)
-				return nil
+				return usage, nil
 			}
-			return err
+			return usage, err
 		}
 
 		msgType := msg.Headers[":message-type"]
 		if msgType == "error" {
-			return fmt.Errorf("EventStream 错误: %s", msg.Headers[":error-message"])
+			return usage, fmt.Errorf("EventStream 错误: %s", msg.Headers[":error-message"])
 		}
 
 		if msgType != "event" {
@@ -230,6 +237,40 @@ func (s *ChatService) parseEventStream(body io.Reader, callback func(content str
 				if event.Content != "" {
 					callback(event.Content, false)
 				}
+			}
+		}
+
+		// 解析 messageMetadataEvent（token 使用量）
+		// 参考 Kiro-account-manager kiroApi.ts 第 680-720 行
+		if eventType == "messageMetadataEvent" {
+			var event struct {
+				TokenUsage *struct {
+					UncachedInputTokens   int `json:"uncachedInputTokens"`
+					CacheReadInputTokens  int `json:"cacheReadInputTokens"`
+					CacheWriteInputTokens int `json:"cacheWriteInputTokens"`
+					OutputTokens          int `json:"outputTokens"`
+					ReasoningTokens       int `json:"reasoningTokens"`
+				} `json:"tokenUsage"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil && event.TokenUsage != nil {
+				tu := event.TokenUsage
+				// inputTokens = uncached + cacheRead + cacheWrite
+				usage.InputTokens = tu.UncachedInputTokens + tu.CacheReadInputTokens + tu.CacheWriteInputTokens
+				usage.OutputTokens = tu.OutputTokens
+				usage.CacheReadTokens = tu.CacheReadInputTokens
+				usage.CacheWriteTokens = tu.CacheWriteInputTokens
+				usage.ReasoningTokens = tu.ReasoningTokens
+			}
+		}
+
+		// 解析 meteringEvent（credits 消耗）
+		// 参考 Kiro-account-manager kiroApi.ts 第 730-750 行
+		if eventType == "meteringEvent" {
+			var event struct {
+				Usage float64 `json:"usage"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil {
+				usage.Credits += event.Usage
 			}
 		}
 	}
@@ -429,6 +470,7 @@ type ChatMessageWithToolInfo struct {
 }
 
 // ChatStreamWithTools 流式聊天（支持工具调用）
+// 向后兼容版本，不返回 usage 信息
 func (s *ChatService) ChatStreamWithTools(
 	messages []ChatMessage,
 	model string,
@@ -436,24 +478,37 @@ func (s *ChatService) ChatStreamWithTools(
 	toolResults []KiroToolResult,
 	callback ToolUseCallback,
 ) error {
+	_, err := s.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, callback)
+	return err
+}
+
+// ChatStreamWithToolsAndUsage 流式聊天（支持工具调用，返回精确 usage）
+// 返回 KiroUsage 包含从 Kiro API EventStream 解析的精确 token 使用量
+func (s *ChatService) ChatStreamWithToolsAndUsage(
+	messages []ChatMessage,
+	model string,
+	tools []KiroToolWrapper,
+	toolResults []KiroToolResult,
+	callback ToolUseCallback,
+) (*KiroUsage, error) {
 	token, accountID, err := s.authManager.GetAccessTokenWithAccountID()
 	if err != nil {
 		token, err = s.authManager.GetAccessToken()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		accountID = ""
 	}
 
-	if accountID != "" {
-		fmt.Printf("[轮询] 使用账号: %s\n", accountID[:8])
-	}
+	// 线上环境已禁用调试日志
 
 	conversationID := generateConversationID()
 
 	// 构建 Kiro API 格式的历史消息和当前消息
-	history, currentMessage := s.buildKiroMessages(messages, tools, toolResults)
+	history, currentMessage := s.buildKiroMessages(messages, model, tools, toolResults)
 
+	// 注意：customizationArn 需要 ARN 格式，简单模型 ID 不被接受
+	// Kiro API 会根据账号配置自动选择模型，暂不传递 customizationArn
 	reqBody := map[string]any{
 		"conversationState": map[string]any{
 			"conversationId":  conversationID,
@@ -463,17 +518,10 @@ func (s *ChatService) ChatStreamWithTools(
 		},
 	}
 
-	if model != "" && IsValidModel(model) {
-		reqBody["customizationArn"] = model
-	}
-
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// 调试：打印请求体
-	fmt.Printf("[DEBUG] Kiro API 请求体:\n%s\n", string(body))
 
 	region := s.authManager.GetRegion()
 	var endpoint string
@@ -487,7 +535,7 @@ func (s *ChatService) ChatStreamWithTools(
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -502,14 +550,14 @@ func (s *ChatService) ChatStreamWithTools(
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		s.authManager.RecordRequestResult(accountID, false)
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		s.authManager.RecordRequestResult(accountID, false)
-		return fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	s.authManager.RecordRequestResult(accountID, true)
@@ -518,7 +566,10 @@ func (s *ChatService) ChatStreamWithTools(
 }
 
 // parseEventStreamWithTools 解析 EventStream（支持工具调用）
-func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUseCallback) error {
+// 返回 KiroUsage 包含从 API 获取的精确 token 使用量
+func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUseCallback) (*KiroUsage, error) {
+	usage := &KiroUsage{}
+
 	// 工具调用状态跟踪
 	var currentToolUse *struct {
 		ToolUseId   string
@@ -541,14 +592,14 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 					}, false)
 				}
 				callback("", nil, true)
-				return nil
+				return usage, nil
 			}
-			return err
+			return usage, err
 		}
 
 		msgType := msg.Headers[":message-type"]
 		if msgType == "error" {
-			return fmt.Errorf("EventStream 错误: %s", msg.Headers[":error-message"])
+			return usage, fmt.Errorf("EventStream 错误: %s", msg.Headers[":error-message"])
 		}
 
 		if msgType != "event" {
@@ -566,6 +617,40 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 				if event.Content != "" {
 					callback(event.Content, nil, false)
 				}
+			}
+		}
+
+		// 解析 messageMetadataEvent（token 使用量）
+		// 参考 Kiro-account-manager kiroApi.ts 第 680-720 行
+		if eventType == "messageMetadataEvent" {
+			var event struct {
+				TokenUsage *struct {
+					UncachedInputTokens   int `json:"uncachedInputTokens"`
+					CacheReadInputTokens  int `json:"cacheReadInputTokens"`
+					CacheWriteInputTokens int `json:"cacheWriteInputTokens"`
+					OutputTokens          int `json:"outputTokens"`
+					ReasoningTokens       int `json:"reasoningTokens"`
+				} `json:"tokenUsage"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil && event.TokenUsage != nil {
+				tu := event.TokenUsage
+				// inputTokens = uncached + cacheRead + cacheWrite
+				usage.InputTokens = tu.UncachedInputTokens + tu.CacheReadInputTokens + tu.CacheWriteInputTokens
+				usage.OutputTokens = tu.OutputTokens
+				usage.CacheReadTokens = tu.CacheReadInputTokens
+				usage.CacheWriteTokens = tu.CacheWriteInputTokens
+				usage.ReasoningTokens = tu.ReasoningTokens
+			}
+		}
+
+		// 解析 meteringEvent（credits 消耗）
+		// 参考 Kiro-account-manager kiroApi.ts 第 730-750 行
+		if eventType == "meteringEvent" {
+			var event struct {
+				Usage float64 `json:"usage"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil {
+				usage.Credits += event.Usage
 			}
 		}
 
@@ -651,10 +736,12 @@ func parseToolInput(buffer string) map[string]interface{} {
 }
 
 // buildKiroMessages 构建 Kiro API 格式的消息
-// 参考 kiroApi.ts 的 sanitizeConversation 实现
+// 参考 kiroApi.ts 的 sanitizeConversation 和 buildKiroPayload 实现
 // 返回：history（历史消息数组）, currentMessage（当前消息）
+// 关键：toolResults 参数只用于 currentMessage，历史消息从 ChatMessage.ToolResults 读取
 func (s *ChatService) buildKiroMessages(
 	messages []ChatMessage,
+	model string,
 	tools []KiroToolWrapper,
 	toolResults []KiroToolResult,
 ) ([]map[string]any, map[string]any) {
@@ -662,22 +749,26 @@ func (s *ChatService) buildKiroMessages(
 		return nil, nil
 	}
 
-	// 步骤1：确保消息以 user 开始
-	msgs := s.ensureStartsWithUser(messages)
+	// 参考 Kiro-account-manager 的 sanitizeConversation 调用顺序：
+	// 1. ensureStartsWithUserMessage
+	// 2. removeEmptyUserMessages
+	// 3. ensureValidToolUsesAndResults
+	// 4. ensureAlternatingMessages
+	// 5. ensureEndsWithUserMessage
 
-	// 步骤2：确保消息以 user 结束
+	msgs := s.ensureStartsWithUser(messages)
+	msgs = s.removeEmptyUserMessages(msgs)
+	msgs = s.ensureValidToolUsesAndResults(msgs)
+	msgs = s.ensureAlternating(msgs)
 	msgs = s.ensureEndsWithUser(msgs)
 
-	// 步骤3：确保消息交替（合并连续的同角色消息）
-	msgs = s.ensureAlternating(msgs)
-
-	// 步骤4：构建 Kiro 格式的消息
+	// 构建 Kiro 格式的消息
 	history := make([]map[string]any, 0)
 
 	// 历史消息（除了最后一条）
 	for i := 0; i < len(msgs)-1; i++ {
 		msg := msgs[i]
-		kiroMsg := s.convertToKiroHistoryMessage(msg, tools, nil)
+		kiroMsg := s.convertToKiroHistoryMessage(msg, model)
 		if kiroMsg != nil {
 			history = append(history, kiroMsg)
 		}
@@ -687,10 +778,112 @@ func (s *ChatService) buildKiroMessages(
 	var currentMessage map[string]any
 	if len(msgs) > 0 {
 		lastMsg := msgs[len(msgs)-1]
-		currentMessage = s.buildCurrentMessage(lastMsg, tools, toolResults)
+		currentMessage = s.buildCurrentMessage(lastMsg, model, tools, toolResults)
 	}
 
 	return history, currentMessage
+}
+
+// hasToolUses 检查 assistant 消息是否有 toolUses
+func hasToolUses(msg ChatMessage) bool {
+	return msg.Role == "assistant" && len(msg.ToolUses) > 0
+}
+
+// hasToolResults 检查 user 消息是否有 toolResults
+func hasToolResults(msg ChatMessage) bool {
+	return msg.Role == "user" && len(msg.ToolResults) > 0
+}
+
+// hasMatchingToolResults 检查 toolResults 是否与 toolUses 匹配
+func hasMatchingToolResults(toolUses []KiroToolUse, toolResults []KiroToolResult) bool {
+	if len(toolUses) == 0 {
+		return true
+	}
+	if len(toolResults) == 0 {
+		return false
+	}
+	// 检查所有 toolUses 是否都有对应的 toolResults
+	for _, tu := range toolUses {
+		found := false
+		for _, tr := range toolResults {
+			if tr.ToolUseId == tu.ToolUseId {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// createFailedToolResultMessage 创建失败的工具结果消息
+func createFailedToolResultMessage(toolUseIds []string) ChatMessage {
+	results := make([]KiroToolResult, 0, len(toolUseIds))
+	for _, id := range toolUseIds {
+		results = append(results, KiroToolResult{
+			ToolUseId: id,
+			Content:   []KiroToolContent{{Text: "Tool execution failed"}},
+			Status:    "error",
+		})
+	}
+	return ChatMessage{
+		Role:        "user",
+		Content:     "",
+		ToolResults: results,
+	}
+}
+
+// ensureValidToolUsesAndResults 确保每个有 toolUses 的 assistant 消息后面都有对应的 toolResults
+// 参考 Kiro-account-manager 的 sanitizeConversation 实现
+func (s *ChatService) ensureValidToolUsesAndResults(messages []ChatMessage) []ChatMessage {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	result := make([]ChatMessage, 0, len(messages))
+
+	for i := 0; i < len(messages); i++ {
+		msg := messages[i]
+		result = append(result, msg)
+
+		// 如果是 assistant 消息且有 toolUses
+		if hasToolUses(msg) {
+			// 检查下一条消息
+			var nextMsg *ChatMessage
+			if i+1 < len(messages) {
+				nextMsg = &messages[i+1]
+			}
+
+			// 如果没有下一条消息，或下一条不是 user，或没有 toolResults
+			if nextMsg == nil || nextMsg.Role != "user" || !hasToolResults(*nextMsg) {
+				// 添加失败的工具结果消息
+				toolUseIds := make([]string, 0, len(msg.ToolUses))
+				for idx, tu := range msg.ToolUses {
+					id := tu.ToolUseId
+					if id == "" {
+						id = fmt.Sprintf("toolUse_%d", idx+1)
+					}
+					toolUseIds = append(toolUseIds, id)
+				}
+				result = append(result, createFailedToolResultMessage(toolUseIds))
+			} else if !hasMatchingToolResults(msg.ToolUses, nextMsg.ToolResults) {
+				// toolResults 不匹配，添加失败消息
+				toolUseIds := make([]string, 0, len(msg.ToolUses))
+				for idx, tu := range msg.ToolUses {
+					id := tu.ToolUseId
+					if id == "" {
+						id = fmt.Sprintf("toolUse_%d", idx+1)
+					}
+					toolUseIds = append(toolUseIds, id)
+				}
+				result = append(result, createFailedToolResultMessage(toolUseIds))
+			}
+		}
+	}
+
+	return result
 }
 
 // ensureStartsWithUser 确保消息以 user 开始
@@ -703,12 +896,55 @@ func (s *ChatService) ensureStartsWithUser(messages []ChatMessage) []ChatMessage
 	if messages[0].Role != "user" {
 		placeholder := ChatMessage{
 			Role:    "user",
-			Content: "Continue the conversation.",
+			Content: "Hello",
 		}
 		return append([]ChatMessage{placeholder}, messages...)
 	}
 
 	return messages
+}
+
+// removeEmptyUserMessages 移除空的 user 消息
+// 参考 Kiro-account-manager 的实现：保留第一条 user 消息和有 toolResults 的消息
+func (s *ChatService) removeEmptyUserMessages(messages []ChatMessage) []ChatMessage {
+	if len(messages) <= 1 {
+		return messages
+	}
+
+	// 找到第一条 user 消息的索引
+	firstUserIdx := -1
+	for i, msg := range messages {
+		if msg.Role == "user" {
+			firstUserIdx = i
+			break
+		}
+	}
+
+	result := make([]ChatMessage, 0, len(messages))
+	for i, msg := range messages {
+		// assistant 消息保留
+		if msg.Role == "assistant" {
+			result = append(result, msg)
+			continue
+		}
+		// 第一条 user 消息保留
+		if msg.Role == "user" && i == firstUserIdx {
+			result = append(result, msg)
+			continue
+		}
+		// 有内容或有 toolResults 的 user 消息保留
+		if msg.Role == "user" {
+			hasContent := strings.TrimSpace(msg.Content) != ""
+			if hasContent || len(msg.ToolResults) > 0 {
+				result = append(result, msg)
+			}
+			continue
+		}
+		// 其他消息保留
+		result = append(result, msg)
+	}
+
+	return result
 }
 
 // ensureEndsWithUser 确保消息以 user 结束
@@ -729,47 +965,53 @@ func (s *ChatService) ensureEndsWithUser(messages []ChatMessage) []ChatMessage {
 	return messages
 }
 
-// ensureAlternating 确保消息交替（合并连续的同角色消息）
+// ensureAlternating 确保消息交替
+// 参考 Kiro-account-manager 实现：在连续同角色消息之间插入占位消息
+// 不合并消息，以保持 ToolUses 和 ToolResults 的完整性
 func (s *ChatService) ensureAlternating(messages []ChatMessage) []ChatMessage {
 	if len(messages) <= 1 {
 		return messages
 	}
 
-	result := make([]ChatMessage, 0, len(messages))
+	result := make([]ChatMessage, 0, len(messages)*2)
 	result = append(result, messages[0])
 
 	for i := 1; i < len(messages); i++ {
 		curr := messages[i]
-		prev := &result[len(result)-1]
+		prev := result[len(result)-1]
 
-		// 如果当前消息和前一条角色相同，合并内容
+		// 如果当前消息和前一条角色相同，插入占位消息
 		if curr.Role == prev.Role {
-			if prev.Content != "" && curr.Content != "" {
-				prev.Content = prev.Content + "\n\n" + curr.Content
-			} else if curr.Content != "" {
-				prev.Content = curr.Content
+			if prev.Role == "user" {
+				// 两个连续 user 消息，插入 assistant 占位消息
+				result = append(result, ChatMessage{
+					Role:    "assistant",
+					Content: "Understood.",
+				})
+			} else {
+				// 两个连续 assistant 消息，插入 user 占位消息
+				result = append(result, ChatMessage{
+					Role:    "user",
+					Content: "Continue.",
+				})
 			}
-			// 合并图片
-			prev.Images = append(prev.Images, curr.Images...)
-		} else {
-			result = append(result, curr)
 		}
+		result = append(result, curr)
 	}
 
 	return result
 }
 
 // convertToKiroHistoryMessage 转换单条消息为 Kiro 历史消息格式
-func (s *ChatService) convertToKiroHistoryMessage(
-	msg ChatMessage,
-	tools []KiroToolWrapper,
-	toolResults []KiroToolResult,
-) map[string]any {
+// 注意：历史消息中的 user 消息不需要 tools，只需要 toolResults
+// tools 只放在 currentMessage 中（参考 Kiro-account-manager 的 buildKiroPayload）
+func (s *ChatService) convertToKiroHistoryMessage(msg ChatMessage, model string) map[string]any {
 	switch msg.Role {
 	case "user":
 		userMsg := map[string]any{
 			"content": msg.Content,
 			"origin":  "AI_EDITOR",
+			"modelId": model,
 		}
 
 		// 添加图片
@@ -784,10 +1026,24 @@ func (s *ChatService) convertToKiroHistoryMessage(
 			userMsg["images"] = images
 		}
 
-		// 添加 tools（每条 user 消息都需要带上 tools）
-		if len(tools) > 0 {
-			ctx := s.buildUserInputMessageContext(tools, nil)
-			userMsg["userInputMessageContext"] = ctx
+		// 关键：历史消息中的 user 消息只需要 toolResults，不需要 tools
+		// toolResults 从 ChatMessage.ToolResults 读取
+		if len(msg.ToolResults) > 0 {
+			resultsData := make([]map[string]any, 0, len(msg.ToolResults))
+			for _, r := range msg.ToolResults {
+				contentData := make([]map[string]any, 0, len(r.Content))
+				for _, c := range r.Content {
+					contentData = append(contentData, map[string]any{"text": c.Text})
+				}
+				resultsData = append(resultsData, map[string]any{
+					"toolUseId": r.ToolUseId,
+					"content":   contentData,
+					"status":    r.Status,
+				})
+			}
+			userMsg["userInputMessageContext"] = map[string]any{
+				"toolResults": resultsData,
+			}
 		}
 
 		return map[string]any{"userInputMessage": userMsg}
@@ -817,12 +1073,14 @@ func (s *ChatService) convertToKiroHistoryMessage(
 // buildCurrentMessage 构建当前消息（最后一条 user 消息）
 func (s *ChatService) buildCurrentMessage(
 	msg ChatMessage,
+	model string,
 	tools []KiroToolWrapper,
 	toolResults []KiroToolResult,
 ) map[string]any {
 	userMsg := map[string]any{
 		"content": msg.Content,
 		"origin":  "AI_EDITOR",
+		"modelId": model,
 	}
 
 	// 添加图片
