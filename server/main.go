@@ -363,6 +363,16 @@ func getAccountStats() map[string]*AccountStats {
 func handleGetAccountStats(c *gin.Context) {
 	stats := getAccountStats()
 
+	// 构建 accountId -> email 映射
+	emailMap := make(map[string]string)
+	if accountsConfig, err := client.Auth.LoadAccountsConfig(); err == nil {
+		for _, acc := range accountsConfig.Accounts {
+			if acc.Email != "" {
+				emailMap[acc.ID] = acc.Email
+			}
+		}
+	}
+
 	// 计算总请求数
 	var totalRequests int64
 	for _, s := range stats {
@@ -378,6 +388,7 @@ func handleGetAccountStats(c *gin.Context) {
 		}
 		accounts = append(accounts, map[string]any{
 			"accountId":    id,
+			"email":        emailMap[id], // 添加邮箱字段
 			"requestCount": s.RequestCount,
 			"successCount": s.SuccessCount,
 			"failCount":    s.FailCount,

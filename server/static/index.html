@@ -1269,10 +1269,11 @@
             html += '<div class="flex-1 space-y-1 max-h-40 overflow-y-auto">';
             accounts.forEach((acc, i) => {
                 const color = chartColors[i % chartColors.length];
-                const shortId = acc.accountId.substring(0, 8);
+                // 优先显示邮箱，没有则显示 ID 前 8 位
+                const displayName = acc.email || acc.accountId.substring(0, 8);
                 html += `<div class="flex items-center text-sm">
                     <span class="w-3 h-3 rounded-full mr-2" style="background:${color}"></span>
-                    <span class="text-gray-600">${shortId}</span>
+                    <span class="text-gray-600 truncate max-w-32" title="${acc.email || acc.accountId}">${displayName}</span>
                     <span class="ml-auto font-medium">${acc.percent.toFixed(1)}%</span>
                 </div>`;
             });
@@ -1290,12 +1291,13 @@
             const sorted = [...accounts].sort((a, b) => b.requestCount - a.requestCount);
             let html = '';
             sorted.forEach((acc, i) => {
-                const shortId = acc.accountId.substring(0, 8);
+                // 优先显示邮箱，没有则显示 ID 前 8 位
+                const displayName = acc.email || acc.accountId.substring(0, 8);
                 const barWidth = total > 0 ? (acc.requestCount / total * 100) : 0;
                 const color = chartColors[i % chartColors.length];
                 html += `<div class="flex items-center space-x-3">
                     <span class="w-6 text-center font-bold text-gray-400">#${i + 1}</span>
-                    <span class="w-20 text-sm text-gray-600 font-mono">${shortId}</span>
+                    <span class="w-32 text-sm text-gray-600 truncate" title="${acc.email || acc.accountId}">${displayName}</span>
                     <div class="flex-1 bg-gray-200 rounded-full h-4 overflow-hidden">
                         <div class="h-full rounded-full transition-all" style="width:${barWidth}%;background:${color}"></div>
                     </div>
@@ -1313,7 +1315,8 @@
             }
             let html = '';
             accounts.forEach((acc, i) => {
-                const shortId = acc.accountId.substring(0, 8);
+                // 优先显示邮箱，没有则显示 ID 前 8 位
+                const displayName = acc.email || acc.accountId.substring(0, 8);
                 const successRate = acc.requestCount > 0 ? (acc.successCount / acc.requestCount * 100).toFixed(1) : 0;
                 const statusCodes = acc.statusCodes || {};
                 const errors = acc.errors || {};
@@ -1321,7 +1324,7 @@
                     <div class="flex items-center justify-between mb-3">
                         <div class="flex items-center space-x-2">
                             <span class="w-3 h-3 rounded-full" style="background:${chartColors[i % chartColors.length]}"></span>
-                            <span class="font-mono font-medium">${shortId}</span>
+                            <span class="font-medium truncate max-w-48" title="${acc.email || acc.accountId}">${displayName}</span>
                         </div>
                         <div class="flex items-center space-x-4 text-sm">
                             <span class="text-green-600"><i class="fas fa-check mr-1"></i>${acc.successCount || 0}</span>
