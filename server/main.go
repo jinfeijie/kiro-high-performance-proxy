@@ -1629,9 +1629,11 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 					toolName, _ := m["name"].(string)
 					toolInput, _ := m["input"].(map[string]interface{})
 					if toolUseId != "" && toolName != "" {
+						// 净化工具名（与 tools 定义保持一致）
+						sanitizedName := sanitizeToolName(toolName)
 						msgToolUses = append(msgToolUses, kiroclient.KiroToolUse{
 							ToolUseId: toolUseId,
-							Name:      toolName,
+							Name:      sanitizedName,
 							Input:     toolInput,
 						})
 					}
