@@ -1043,6 +1043,21 @@ func (m *AuthManager) getAccountsConfigPath() string {
 	return "./kiro-accounts.json"
 }
 
+// LoadAccountsConfigFromFile 强制从文件加载账号配置（绕过缓存）
+// 用于新增/删除账号等需要最新数据的场景，避免缓存导致数据丢失
+func (m *AuthManager) LoadAccountsConfigFromFile() (*AccountsConfig, error) {
+	config, err := m.loadAccountsFromFile()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &AccountsConfig{Accounts: []AccountInfo{}}, nil
+		}
+		return nil, fmt.Errorf("读取账号配置失败: %w", err)
+	}
+	// 更新缓存
+	m.updateCache(config)
+	return config, nil
+}
+
 // LoadAccountsConfig 加载多账号配置（优先从缓存读取）
 // 如果配置文件不存在但有 Token，自动将当前 Token 作为第一个账号
 func (m *AuthManager) LoadAccountsConfig() (*AccountsConfig, error) {
@@ -1435,8 +1450,8 @@ func (m *AuthManager) CompleteLogin(session *LoginSession) (*AccountInfo, error)
 		}
 	}
 
-	// 加载现有账号配置
-	config, err := m.LoadAccountsConfig()
+	// 加载现有账号配置（强制从文件读取，避免缓存导致数据丢失）
+	config, err := m.LoadAccountsConfigFromFile()
 	if err != nil {
 		config = &AccountsConfig{Accounts: []AccountInfo{}}
 	}
@@ -1454,7 +1469,8 @@ func (m *AuthManager) CompleteLogin(session *LoginSession) (*AccountInfo, error)
 
 // DeleteAccount 删除账号
 func (m *AuthManager) DeleteAccount(accountID string) error {
-	config, err := m.LoadAccountsConfig()
+	// 强制从文件读取，避免缓存导致数据丢失
+	config, err := m.LoadAccountsConfigFromFile()
 	if err != nil {
 		return fmt.Errorf("加载账号配置失败: %w", err)
 	}
@@ -1805,8 +1821,8 @@ func (m *AuthManager) ImportAccount(tokenJSON, clientRegJSON string) (*AccountIn
 		}
 	}
 
-	// 加载现有账号配置
-	config, err := m.LoadAccountsConfig()
+	// 加载现有账号配置（强制从文件读取，避免缓存导致数据丢失）
+	config, err := m.LoadAccountsConfigFromFile()
 	if err != nil {
 		config = &AccountsConfig{Accounts: []AccountInfo{}}
 	}
