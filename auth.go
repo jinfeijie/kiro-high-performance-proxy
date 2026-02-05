@@ -669,6 +669,32 @@ func (m *AuthManager) GetLastSelectedAccountID() string {
 	return m.lastSelectedAccountID
 }
 
+// GetLastSelectedAccountInfo 获取上一次选中账号的 ID 和 Email
+// 用于统计记录时同时写入 email，避免读取时再查询
+func (m *AuthManager) GetLastSelectedAccountInfo() (accountID string, email string) {
+	m.usageMu.RLock()
+	accountID = m.lastSelectedAccountID
+	m.usageMu.RUnlock()
+
+	if accountID == "" {
+		return "", ""
+	}
+
+	// 从缓存中查找对应账号的 email
+	config := m.getAccountsFromCache()
+	if config == nil {
+		return accountID, ""
+	}
+
+	for _, acc := range config.Accounts {
+		if acc.ID == accountID {
+			return accountID, acc.Email
+		}
+	}
+
+	return accountID, ""
+}
+
 // RecordRequestResult 记录请求结果（用于熔断器）
 func (m *AuthManager) RecordRequestResult(accountID string, success bool) {
 	if accountID == "" {

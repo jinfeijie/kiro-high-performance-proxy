@@ -1,6 +1,7 @@
 {
   "13695d0307a73926": {
     "accountId": "13695d0307a73926",
+    "email": "",
     "requestCount": 2,
     "successCount": 0,
     "failCount": 2,
@@ -14,6 +15,7 @@
   },
   "22e24ba72c7cb78f": {
     "accountId": "22e24ba72c7cb78f",
+    "email": "",
     "requestCount": 11,
     "successCount": 7,
     "failCount": 4,
@@ -28,6 +30,7 @@
   },
   "671511701c243958": {
     "accountId": "671511701c243958",
+    "email": "",
     "requestCount": 8,
     "successCount": 5,
     "failCount": 3,
@@ -42,6 +45,7 @@
   },
   "7ab839e2e759e8f7": {
     "accountId": "7ab839e2e759e8f7",
+    "email": "",
     "requestCount": 10,
     "successCount": 6,
     "failCount": 4,
@@ -56,6 +60,7 @@
   },
   "c8a569c4390cba49": {
     "accountId": "c8a569c4390cba49",
+    "email": "",
     "requestCount": 6,
     "successCount": 4,
     "failCount": 2,
@@ -70,6 +75,7 @@
   },
   "dd7dbb710df8339e": {
     "accountId": "dd7dbb710df8339e",
+    "email": "",
     "requestCount": 4,
     "successCount": 1,
     "failCount": 3,
@@ -84,6 +90,7 @@
   },
   "f0a4585ef2e742c0": {
     "accountId": "f0a4585ef2e742c0",
+    "email": "",
     "requestCount": 9,
     "successCount": 5,
     "failCount": 4,
@@ -98,6 +105,7 @@
   },
   "fbdf1fa169462c28": {
     "accountId": "fbdf1fa169462c28",
+    "email": "",
     "requestCount": 5,
     "successCount": 1,
     "failCount": 4,

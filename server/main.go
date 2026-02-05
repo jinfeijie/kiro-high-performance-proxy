@@ -178,6 +178,7 @@ var accountStatsMutex sync.RWMutex
 // AccountStats 单个账号的统计数据
 type AccountStats struct {
 	AccountID    string           `json:"accountId"`
+	Email        string           `json:"email"` // 账号邮箱（写入时记录，避免读取时查询）
 	RequestCount int64            `json:"requestCount"`
 	SuccessCount int64            `json:"successCount"`
 	FailCount    int64            `json:"failCount"`
@@ -305,7 +306,7 @@ func saveAccountStats() {
 }
 
 // recordAccountRequest 记录账号请求（状态码和错误）
-func recordAccountRequest(accountID string, statusCode int, errMsg string) {
+func recordAccountRequest(accountID, email string, statusCode int, errMsg string) {
 	if accountID == "" {
 		return
 	}
@@ -317,10 +318,16 @@ func recordAccountRequest(accountID string, statusCode int, errMsg string) {
 	if !exists {
 		stats = &AccountStats{
 			AccountID:   accountID,
+			Email:       email,
 			StatusCodes: make(map[int]int64),
 			Errors:      make(map[string]int64),
 		}
 		accountStats[accountID] = stats
+	}
+
+	// 更新 email（如果之前为空，现在有值）
+	if stats.Email == "" && email != "" {
+		stats.Email = email
 	}
 
 	stats.RequestCount++
@@ -363,23 +370,13 @@ func getAccountStats() map[string]*AccountStats {
 func handleGetAccountStats(c *gin.Context) {
 	stats := getAccountStats()
 
-	// 构建 accountId -> email 映射
-	emailMap := make(map[string]string)
-	if accountsConfig, err := client.Auth.LoadAccountsConfig(); err == nil {
-		for _, acc := range accountsConfig.Accounts {
-			if acc.Email != "" {
-				emailMap[acc.ID] = acc.Email
-			}
-		}
-	}
-
 	// 计算总请求数
 	var totalRequests int64
 	for _, s := range stats {
 		totalRequests += s.RequestCount
 	}
 
-	// 构建响应数据
+	// 构建响应数据（email 已在写入时记录，无需动态查询）
 	accounts := make([]map[string]any, 0)
 	for id, s := range stats {
 		percent := float64(0)
@@ -388,7 +385,7 @@ func handleGetAccountStats(c *gin.Context) {
 		}
 		accounts = append(accounts, map[string]any{
 			"accountId":    id,
-			"email":        emailMap[id], // 添加邮箱字段
+			"email":        s.Email, // 直接使用写入时记录的 email
 			"requestCount": s.RequestCount,
 			"successCount": s.SuccessCount,
 			"failCount":    s.FailCount,
@@ -1951,8 +1948,8 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 
 	if err != nil {
 		// 记录账号请求失败
-		accountID := client.Auth.GetLastSelectedAccountID()
-		recordAccountRequest(accountID, 500, err.Error())
+		accountID, email := client.Auth.GetLastSelectedAccountInfo()
+		recordAccountRequest(accountID, email, 500, err.Error())
 		// 记录流式响应错误
 		if logger != nil {
 			logger.Error(GetMsgID(c), "流式响应失败", map[string]any{
@@ -1966,8 +1963,8 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		flusher.Flush()
 	} else {
 		// 记录账号请求成功
-		accountID := client.Auth.GetLastSelectedAccountID()
-		recordAccountRequest(accountID, 200, "")
+		accountID, email := client.Auth.GetLastSelectedAccountInfo()
+		recordAccountRequest(accountID, email, 200, "")
 
 		// 使用精确 usage（如果可用），否则降级使用估算值
 		inputTokens := estimatedInputTokens
@@ -2003,8 +2000,8 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 
 	if err != nil {
 		// 记录账号请求失败
-		accountID := client.Auth.GetLastSelectedAccountID()
-		recordAccountRequest(accountID, 500, err.Error())
+		accountID, email := client.Auth.GetLastSelectedAccountInfo()
+		recordAccountRequest(accountID, email, 500, err.Error())
 		if logger != nil {
 			RecordError(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "非流式响应失败", map[string]any{
@@ -2021,8 +2018,8 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	response := responseBuilder.String()
 
 	// 记录账号请求成功
-	accountID := client.Auth.GetLastSelectedAccountID()
-	recordAccountRequest(accountID, 200, "")
+	accountID, email := client.Auth.GetLastSelectedAccountInfo()
+	recordAccountRequest(accountID, email, 200, "")
 
 	// 使用精确 usage（如果可用），否则降级使用估算值
 	inputTokens := estimatedInputTokens
@@ -2288,8 +2285,8 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 	})
 
 	if err != nil {
-		accountID := client.Auth.GetLastSelectedAccountID()
-		recordAccountRequest(accountID, 500, err.Error())
+		accountID, email := client.Auth.GetLastSelectedAccountInfo()
+		recordAccountRequest(accountID, email, 500, err.Error())
 		// 记录流式响应（带工具）错误
 		if logger != nil {
 			logger.Error(GetMsgID(c), "流式响应(Tools)失败", map[string]any{
@@ -2303,8 +2300,8 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
 	} else {
-		accountID := client.Auth.GetLastSelectedAccountID()
-		recordAccountRequest(accountID, 200, "")
+		accountID, email := client.Auth.GetLastSelectedAccountInfo()
+		recordAccountRequest(accountID, email, 200, "")
 
 		// 使用 Kiro API 返回的精确 usage 值（如果有），否则降级使用本地估算
 		inputTokens := estimatedInputTokens
@@ -2341,8 +2338,8 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	})
 
 	if err != nil {
-		accountID := client.Auth.GetLastSelectedAccountID()
-		recordAccountRequest(accountID, 500, err.Error())
+		accountID, email := client.Auth.GetLastSelectedAccountInfo()
+		recordAccountRequest(accountID, email, 500, err.Error())
 		if logger != nil {
 			RecordError(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "非流式响应(Tools)失败", map[string]any{
@@ -2357,8 +2354,8 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 		return
 	}
 
-	accountID := client.Auth.GetLastSelectedAccountID()
-	recordAccountRequest(accountID, 200, "")
+	accountID, email := client.Auth.GetLastSelectedAccountInfo()
+	recordAccountRequest(accountID, email, 200, "")
 
 	// 使用 Kiro API 返回的精确 usage 值（如果有），否则降级使用本地估算
 	inputTokens := estimatedInputTokens
