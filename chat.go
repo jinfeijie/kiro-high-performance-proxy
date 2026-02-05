@@ -8,10 +8,618 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// TruncationType 截断类型
+// 用于标识 JSON 字符串被截断的方式，便于后续修复处理
+type TruncationType int
+
+const (
+	TruncationNone    TruncationType = iota // 非截断（完整或语法错误）
+	TruncationBracket                       // 缺少闭合括号/花括号
+	TruncationString                        // 字符串值未闭合
+	TruncationNumber                        // 数字值不完整
+	TruncationKey                           // 键名不完整
+	TruncationColon                         // 冒号后无值
+)
+
+// String 返回截断类型的字符串表示，便于调试和日志
+func (t TruncationType) String() string {
+	switch t {
+	case TruncationNone:
+		return "none"
+	case TruncationBracket:
+		return "bracket"
+	case TruncationString:
+		return "string"
+	case TruncationNumber:
+		return "number"
+	case TruncationKey:
+		return "key"
+	case TruncationColon:
+		return "colon"
+	default:
+		return "unknown"
+	}
+}
+
+// detectTruncation 检测 JSON 截断类型
+// 返回截断类型和截断位置
+// 设计原则：使用栈跟踪括号嵌套，跟踪字符串状态，检测不完整的数字
+// 区分截断（可修复）和语法错误（不可修复）
+func detectTruncation(s string) (TruncationType, int) {
+	if s == "" {
+		return TruncationNone, 0
+	}
+
+	// 去除首尾空白
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return TruncationNone, 0
+	}
+
+	n := len(s)
+
+	// 状态跟踪
+	var bracketStack []byte // 括号栈：存储 '{' 或 '['
+	inString := false       // 是否在字符串内部
+	escaped := false        // 前一个字符是否是转义符 '\'
+	lastTokenType := 0      // 上一个 token 类型：0=无, 1=key, 2=colon, 3=value, 4=comma
+	valueStart := -1        // 当前值的起始位置
+
+	for i := 0; i < n; i++ {
+		c := s[i]
+
+		// 处理转义字符
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		// 在字符串内部
+		if inString {
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+				lastTokenType = 3 // value
+				valueStart = -1
+			}
+			continue
+		}
+
+		// 不在字符串内部
+		switch c {
+		case '"':
+			inString = true
+			if lastTokenType == 2 { // 冒号后面
+				valueStart = i
+				lastTokenType = 3
+			} else if lastTokenType == 0 || lastTokenType == 4 || lastTokenType == 5 { // 开始或逗号后或左括号后
+				// 可能是 key
+				if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '{' {
+					lastTokenType = 1 // key
+				} else {
+					lastTokenType = 3 // 数组中的字符串值
+				}
+				valueStart = i
+			}
+
+		case ':':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '{' {
+				lastTokenType = 2 // colon
+			}
+
+		case ',':
+			lastTokenType = 4 // comma
+			valueStart = -1
+
+		case '{', '[':
+			bracketStack = append(bracketStack, c)
+			lastTokenType = 5 // 左括号
+			valueStart = -1
+
+		case '}', ']':
+			if len(bracketStack) == 0 {
+				// 多余的闭合括号 - 语法错误
+				return TruncationNone, i
+			}
+			expected := byte('{')
+			if c == ']' {
+				expected = '['
+			}
+			if bracketStack[len(bracketStack)-1] != expected {
+				// 括号不匹配 - 语法错误
+				return TruncationNone, i
+			}
+			bracketStack = bracketStack[:len(bracketStack)-1]
+			lastTokenType = 3 // value
+			valueStart = -1
+
+		case ' ', '\t', '\n', '\r':
+			// 跳过空白字符
+			continue
+
+		default:
+			// 数字、布尔值、null
+			if lastTokenType == 2 || lastTokenType == 4 || lastTokenType == 5 || lastTokenType == 0 {
+				// 冒号后、逗号后、左括号后、开始位置
+				if valueStart == -1 {
+					valueStart = i
+				}
+				lastTokenType = 3
+			}
+		}
+	}
+
+	// 分析结束状态，判断截断类型
+
+	// 1. 字符串未闭合
+	if inString {
+		return TruncationString, valueStart
+	}
+
+	// 2. 检查是否有未闭合的括号
+	if len(bracketStack) > 0 {
+		// 检查最后的 token 状态
+		lastNonSpace := findLastNonSpace(s)
+		if lastNonSpace >= 0 {
+			lastChar := s[lastNonSpace]
+
+			// 冒号后无值
+			if lastChar == ':' {
+				return TruncationColon, lastNonSpace
+			}
+
+			// 逗号后可能是不完整的 key
+			if lastChar == ',' {
+				return TruncationBracket, n
+			}
+
+			// 检查是否是不完整的数字
+			if isIncompleteNumber(s, lastNonSpace) {
+				return TruncationNumber, findNumberStart(s, lastNonSpace)
+			}
+
+			// 检查是否是不完整的 key（在对象中，逗号后的字符串）
+			if lastTokenType == 1 && !inString {
+				// key 后面没有冒号
+				return TruncationKey, valueStart
+			}
+		}
+
+		return TruncationBracket, n
+	}
+
+	// 3. 括号已闭合，检查是否是完整的 JSON
+	// 尝试解析，如果成功则是完整的 JSON
+	return TruncationNone, 0
+}
+
+// findLastNonSpace 找到最后一个非空白字符的位置
+func findLastNonSpace(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		c := s[i]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			return i
+		}
+	}
+	return -1
+}
+
+// isIncompleteNumber 检查是否是不完整的数字
+// 不完整的数字：以 '.', 'e', 'E', '-', '+' 结尾，或者只有负号
+func isIncompleteNumber(s string, pos int) bool {
+	if pos < 0 || pos >= len(s) {
+		return false
+	}
+
+	c := s[pos]
+
+	// 以这些字符结尾表示数字不完整
+	if c == '.' || c == 'e' || c == 'E' || c == '-' || c == '+' {
+		// 确认前面是数字的一部分
+		if pos == 0 {
+			return c == '-' || c == '+' // 只有符号
+		}
+
+		// 向前查找，确认是数字上下文
+		for i := pos - 1; i >= 0; i-- {
+			pc := s[i]
+			if pc >= '0' && pc <= '9' {
+				return true
+			}
+			if pc == '.' || pc == 'e' || pc == 'E' || pc == '-' || pc == '+' {
+				continue
+			}
+			if pc == ' ' || pc == '\t' || pc == '\n' || pc == '\r' {
+				continue
+			}
+			// 遇到其他字符，检查是否是数字开始的上下文
+			if pc == ':' || pc == ',' || pc == '[' || pc == '{' {
+				return true
+			}
+			break
+		}
+	}
+
+	return false
+}
+
+// findNumberStart 找到数字的起始位置
+func findNumberStart(s string, pos int) int {
+	start := pos
+	for i := pos; i >= 0; i-- {
+		c := s[i]
+		if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '-' || c == '+' {
+			start = i
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		break
+	}
+	return start
+}
+
+// fixTruncatedJSON 尝试修复截断的 JSON
+// 返回修复后的字符串和是否成功
+// 设计原则：根据截断类型应用不同的修复策略，修复后验证 JSON 是否有效
+func fixTruncatedJSON(s string, truncType TruncationType) (string, bool) {
+	if s == "" {
+		return "{}", true
+	}
+
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "{}", true
+	}
+
+	var fixed string
+
+	switch truncType {
+	case TruncationNone:
+		// 非截断情况，直接返回原字符串
+		fixed = s
+
+	case TruncationBracket:
+		// 补全缺失的闭合符号
+		fixed = fixBrackets(s)
+
+	case TruncationString:
+		// 闭合字符串并补全括号
+		fixed = fixTruncatedString(s)
+
+	case TruncationNumber:
+		// 移除不完整的数字部分，然后补全括号
+		fixed = fixTruncatedNumber(s)
+
+	case TruncationKey:
+		// 移除不完整的键并补全
+		fixed = fixTruncatedKey(s)
+
+	case TruncationColon:
+		// 移除不完整的键值对并补全
+		fixed = fixTruncatedColon(s)
+
+	default:
+		return s, false
+	}
+
+	// 验证修复后的 JSON 是否有效
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(fixed), &result); err != nil {
+		// 修复失败，尝试更激进的修复
+		fixed = aggressiveFix(s)
+		if err := json.Unmarshal([]byte(fixed), &result); err != nil {
+			return s, false
+		}
+	}
+
+	return fixed, true
+}
+
+// fixBrackets 补全缺失的闭合括号
+// 分析括号栈，按逆序补全缺失的 } 和 ]
+func fixBrackets(s string) string {
+	var bracketStack []byte
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if inString {
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			bracketStack = append(bracketStack, '{')
+		case '[':
+			bracketStack = append(bracketStack, '[')
+		case '}':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '{' {
+				bracketStack = bracketStack[:len(bracketStack)-1]
+			}
+		case ']':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '[' {
+				bracketStack = bracketStack[:len(bracketStack)-1]
+			}
+		}
+	}
+
+	// 按逆序补全缺失的闭合符号
+	result := s
+	for i := len(bracketStack) - 1; i >= 0; i-- {
+		if bracketStack[i] == '{' {
+			result += "}"
+		} else {
+			result += "]"
+		}
+	}
+
+	return result
+}
+
+// fixTruncatedString 修复截断的字符串
+// 闭合字符串并补全括号
+func fixTruncatedString(s string) string {
+	// 添加闭合引号
+	result := s + `"`
+
+	// 然后补全括号
+	return fixBrackets(result)
+}
+
+// fixTruncatedNumber 修复截断的数字
+// 移除不完整的数字部分（如 '.', 'e', 'E', '-', '+'），然后补全括号
+func fixTruncatedNumber(s string) string {
+	// 找到最后一个非空白字符
+	lastPos := findLastNonSpace(s)
+	if lastPos < 0 {
+		return fixBrackets(s)
+	}
+
+	// 检查最后一个字符是否是不完整的数字部分
+	lastChar := s[lastPos]
+	if lastChar == '.' || lastChar == 'e' || lastChar == 'E' || lastChar == '-' || lastChar == '+' {
+		// 向前查找，移除不完整的数字尾部
+		result := s[:lastPos]
+
+		// 继续检查是否还有不完整的部分
+		for {
+			lastPos = findLastNonSpace(result)
+			if lastPos < 0 {
+				break
+			}
+			lastChar = result[lastPos]
+			if lastChar == '.' || lastChar == 'e' || lastChar == 'E' || lastChar == '-' || lastChar == '+' {
+				result = result[:lastPos]
+			} else {
+				break
+			}
+		}
+
+		return fixBrackets(result)
+	}
+
+	// 如果最后一个字符是数字，直接补全括号
+	return fixBrackets(s)
+}
+
+// fixTruncatedKey 修复截断的键
+// 移除不完整的键并补全
+// 例如：{"a":1,"b -> {"a":1}
+func fixTruncatedKey(s string) string {
+	// 找到最后一个逗号的位置
+	lastComma := strings.LastIndex(s, ",")
+	if lastComma == -1 {
+		// 没有逗号，可能是第一个键被截断
+		// 尝试找到 { 后的内容
+		firstBrace := strings.Index(s, "{")
+		if firstBrace != -1 {
+			// 检查 { 后是否有完整的键值对
+			afterBrace := strings.TrimSpace(s[firstBrace+1:])
+			if afterBrace == "" || afterBrace[0] == '"' {
+				// 可能是空对象或第一个键被截断
+				return fixBrackets(s[:firstBrace+1])
+			}
+		}
+		return fixBrackets(s)
+	}
+
+	// 截断到最后一个逗号之前
+	result := strings.TrimSpace(s[:lastComma])
+
+	// 补全括号
+	return fixBrackets(result)
+}
+
+// fixTruncatedColon 修复冒号后无值的情况
+// 移除不完整的键值对并补全
+// 例如：{"a":1,"b": -> {"a":1}
+func fixTruncatedColon(s string) string {
+	// 找到最后一个逗号的位置
+	lastComma := strings.LastIndex(s, ",")
+	if lastComma == -1 {
+		// 没有逗号，可能是第一个键值对被截断
+		firstBrace := strings.Index(s, "{")
+		if firstBrace != -1 {
+			return fixBrackets(s[:firstBrace+1])
+		}
+		return fixBrackets(s)
+	}
+
+	// 截断到最后一个逗号之前
+	result := strings.TrimSpace(s[:lastComma])
+
+	// 补全括号
+	return fixBrackets(result)
+}
+
+// aggressiveFix 更激进的修复策略
+// 当常规修复失败时，尝试更激进的方法
+func aggressiveFix(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "{}"
+	}
+
+	// 如果不是以 { 或 [ 开头，无法修复
+	if s[0] != '{' && s[0] != '[' {
+		return "{}"
+	}
+
+	// 尝试找到最后一个完整的键值对
+	// 策略：从后向前扫描，找到最后一个有效的 JSON 结构
+
+	// 首先尝试闭合字符串
+	inString := false
+	escaped := false
+	var bracketStack []byte
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if inString {
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			bracketStack = append(bracketStack, '{')
+		case '[':
+			bracketStack = append(bracketStack, '[')
+		case '}':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '{' {
+				bracketStack = bracketStack[:len(bracketStack)-1]
+			}
+		case ']':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '[' {
+				bracketStack = bracketStack[:len(bracketStack)-1]
+			}
+		}
+	}
+
+	result := s
+
+	// 如果在字符串内部，闭合字符串
+	if inString {
+		result += `"`
+	}
+
+	// 检查最后一个字符，处理特殊情况
+	lastPos := findLastNonSpace(result)
+	if lastPos >= 0 {
+		lastChar := result[lastPos]
+		// 如果以逗号结尾，移除逗号
+		if lastChar == ',' {
+			result = strings.TrimSpace(result[:lastPos])
+		}
+		// 如果以冒号结尾，移除整个键值对
+		if lastChar == ':' {
+			lastComma := strings.LastIndex(result, ",")
+			if lastComma != -1 {
+				result = strings.TrimSpace(result[:lastComma])
+			} else {
+				// 没有逗号，找到第一个 {
+				firstBrace := strings.Index(result, "{")
+				if firstBrace != -1 {
+					result = result[:firstBrace+1]
+				}
+			}
+		}
+	}
+
+	// 重新计算括号栈
+	bracketStack = nil
+	inString = false
+	escaped = false
+
+	for i := 0; i < len(result); i++ {
+		c := result[i]
+
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if inString {
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			bracketStack = append(bracketStack, '{')
+		case '[':
+			bracketStack = append(bracketStack, '[')
+		case '}':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '{' {
+				bracketStack = bracketStack[:len(bracketStack)-1]
+			}
+		case ']':
+			if len(bracketStack) > 0 && bracketStack[len(bracketStack)-1] == '[' {
+				bracketStack = bracketStack[:len(bracketStack)-1]
+			}
+		}
+	}
+
+	// 补全括号
+	for i := len(bracketStack) - 1; i >= 0; i-- {
+		if bracketStack[i] == '{' {
+			result += "}"
+		} else {
+			result += "]"
+		}
+	}
+
+	return result
+}
 
 // ChatMessage 聊天消息（支持多模态和工具调用）
 type ChatMessage struct {
@@ -443,8 +1051,111 @@ func (s *ChatService) SimpleChatStream(prompt string, callback func(content stri
 	}, callback)
 }
 
-// ToolUseCallback 工具调用回调（content 为文本，toolUse 为工具调用，done 为结束标志）
-type ToolUseCallback func(content string, toolUse *KiroToolUse, done bool)
+// ToolUseCallback 工具调用回调
+// content: 文本内容
+// toolUse: 工具调用（可选）
+// done: 是否结束
+// isThinking: 是否为 thinking 模式内容（reasoningContentEvent）
+// thinkingFormat: thinking 输出格式配置
+type ToolUseCallback func(content string, toolUse *KiroToolUse, done bool, isThinking bool)
+
+// ThinkingTextProcessor 处理文本中的 <thinking> 标签
+// 参考 Kiro-account-manager proxyServer.ts 的 processText 函数
+// 检测普通响应中的 <thinking> 标签并根据配置转换输出格式
+type ThinkingTextProcessor struct {
+	buffer          string               // 文本缓冲区
+	inThinkingBlock bool                 // 是否在 thinking 块内
+	format          ThinkingOutputFormat // 输出格式
+	Callback        func(text string, isThinking bool)
+}
+
+// NewThinkingTextProcessor 创建 thinking 文本处理器
+func NewThinkingTextProcessor(format ThinkingOutputFormat, callback func(text string, isThinking bool)) *ThinkingTextProcessor {
+	if format == "" {
+		format = ThinkingFormatReasoningContent
+	}
+	return &ThinkingTextProcessor{
+		format:   format,
+		Callback: callback,
+	}
+}
+
+// ProcessText 处理文本，检测并转换 <thinking> 标签
+// 参考 Kiro-account-manager proxyServer.ts 的 processText 函数
+func (p *ThinkingTextProcessor) ProcessText(text string, forceFlush bool) {
+	p.buffer += text
+
+	for {
+		if !p.inThinkingBlock {
+			// 查找 <thinking> 开始标签
+			thinkingStart := strings.Index(p.buffer, "<thinking>")
+			if thinkingStart != -1 {
+				// 输出 thinking 标签之前的内容
+				if thinkingStart > 0 {
+					beforeThinking := p.buffer[:thinkingStart]
+					p.Callback(beforeThinking, false)
+				}
+				p.buffer = p.buffer[thinkingStart+10:] // 移除 <thinking>
+				p.inThinkingBlock = true
+			} else if forceFlush || len(p.buffer) > 50 {
+				// 没有找到标签，安全输出（保留可能的部分标签）
+				safeLength := len(p.buffer)
+				if !forceFlush {
+					safeLength = max(0, len(p.buffer)-15)
+				}
+				if safeLength > 0 {
+					safeText := p.buffer[:safeLength]
+					p.Callback(safeText, false)
+					p.buffer = p.buffer[safeLength:]
+				}
+				break
+			} else {
+				break
+			}
+		} else {
+			// 在 thinking 块内，查找 </thinking> 结束标签
+			thinkingEnd := strings.Index(p.buffer, "</thinking>")
+			if thinkingEnd != -1 {
+				// 输出 thinking 内容
+				thinkingContent := p.buffer[:thinkingEnd]
+				if thinkingContent != "" {
+					p.outputThinkingContent(thinkingContent)
+				}
+				p.buffer = p.buffer[thinkingEnd+11:] // 移除 </thinking>
+				p.inThinkingBlock = false
+			} else if forceFlush {
+				// 强制刷新：输出剩余内容（未闭合的 thinking 块）
+				if p.buffer != "" {
+					p.outputThinkingContent(p.buffer)
+					p.buffer = ""
+				}
+				break
+			} else {
+				break
+			}
+		}
+	}
+}
+
+// outputThinkingContent 根据格式输出 thinking 内容
+func (p *ThinkingTextProcessor) outputThinkingContent(content string) {
+	switch p.format {
+	case ThinkingFormatThinking:
+		// 保持原始 <thinking> 标签
+		p.Callback("<thinking>"+content+"</thinking>", false)
+	case ThinkingFormatThink:
+		// 转换为 <think> 标签
+		p.Callback("<think>"+content+"</think>", false)
+	default:
+		// reasoning_content 格式：标记为 thinking 内容
+		p.Callback(content, true)
+	}
+}
+
+// Flush 刷新缓冲区中剩余的内容
+func (p *ThinkingTextProcessor) Flush() {
+	p.ProcessText("", true)
+}
 
 // KiroHistoryMessage Kiro API 历史消息格式
 type KiroHistoryMessage struct {
@@ -590,14 +1301,20 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 			if err == io.EOF {
 				// 完成未处理的工具调用
 				if currentToolUse != nil && !processedIds[currentToolUse.ToolUseId] {
-					input := parseToolInput(currentToolUse.InputBuffer)
-					callback("", &KiroToolUse{
-						ToolUseId: currentToolUse.ToolUseId,
-						Name:      currentToolUse.Name,
-						Input:     input,
-					}, false)
+					input, ok := parseToolInput(currentToolUse.InputBuffer)
+					if ok {
+						callback("", &KiroToolUse{
+							ToolUseId: currentToolUse.ToolUseId,
+							Name:      currentToolUse.Name,
+							Input:     input,
+						}, false, false)
+					} else {
+						// 无法解析，发送跳过通知并记录日志
+						callback(fmt.Sprintf("\n\n⚠️ Tool \"%s\" was skipped: input truncated by Kiro API (output token limit exceeded)", currentToolUse.Name), nil, false, false)
+						logToolSkipped(currentToolUse.Name, currentToolUse.InputBuffer)
+					}
 				}
-				callback("", nil, true)
+				callback("", nil, true, false)
 				return usage, nil
 			}
 			return usage, err
@@ -621,7 +1338,7 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 			}
 			if err := json.Unmarshal(msg.Payload, &event); err == nil {
 				if event.Content != "" {
-					callback(event.Content, nil, false)
+					callback(event.Content, nil, false, false)
 				}
 			}
 		}
@@ -660,6 +1377,153 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 			}
 		}
 
+		// 解析 reasoningContentEvent（Thinking 模式推理内容）
+		// 参考 Kiro-account-manager kiroApi.ts reasoningContentEvent 处理
+		if eventType == "reasoningContentEvent" {
+			var event struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil && event.Text != "" {
+				// isThinking=true 标记这是思考内容
+				callback(event.Text, nil, false, true)
+				// 累计 reasoning tokens
+				usage.ReasoningTokens += len(event.Text) / 3
+			}
+		}
+
+		// 解析 supplementaryWebLinksEvent（网页链接引用）
+		if eventType == "supplementaryWebLinksEvent" {
+			var event struct {
+				SupplementaryWebLinks []struct {
+					URL     string `json:"url"`
+					Title   string `json:"title"`
+					Snippet string `json:"snippet"`
+				} `json:"supplementaryWebLinks"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil && len(event.SupplementaryWebLinks) > 0 {
+				var links []string
+				for _, link := range event.SupplementaryWebLinks {
+					if link.URL != "" {
+						title := link.Title
+						if title == "" {
+							title = link.URL
+						}
+						links = append(links, fmt.Sprintf("- [%s](%s)", title, link.URL))
+					}
+				}
+				if len(links) > 0 {
+					callback("\n\n🔗 **Web References:**\n"+strings.Join(links, "\n"), nil, false, false)
+				}
+			}
+		}
+
+		// 解析 codeReferenceEvent（代码引用/许可证信息）
+		if eventType == "codeReferenceEvent" {
+			var event struct {
+				References []struct {
+					LicenseName string `json:"licenseName"`
+					Repository  string `json:"repository"`
+					URL         string `json:"url"`
+				} `json:"references"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil && len(event.References) > 0 {
+				var refs []string
+				for _, ref := range event.References {
+					var parts []string
+					if ref.LicenseName != "" {
+						parts = append(parts, "License: "+ref.LicenseName)
+					}
+					if ref.Repository != "" {
+						parts = append(parts, "Repo: "+ref.Repository)
+					}
+					if ref.URL != "" {
+						parts = append(parts, "URL: "+ref.URL)
+					}
+					if len(parts) > 0 {
+						refs = append(refs, strings.Join(parts, ", "))
+					}
+				}
+				if len(refs) > 0 {
+					callback("\n\n📚 **Code References:**\n"+strings.Join(refs, "\n"), nil, false, false)
+				}
+			}
+		}
+
+		// 解析 followupPromptEvent（后续提示建议）
+		if eventType == "followupPromptEvent" {
+			var event struct {
+				FollowupPrompt struct {
+					Content    string `json:"content"`
+					UserIntent string `json:"userIntent"`
+				} `json:"followupPrompt"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil {
+				suggestion := event.FollowupPrompt.Content
+				if suggestion == "" {
+					suggestion = event.FollowupPrompt.UserIntent
+				}
+				if suggestion != "" {
+					callback("\n\n💡 **Suggested follow-up:** "+suggestion, nil, false, false)
+				}
+			}
+		}
+
+		// 解析 citationEvent（引用事件）
+		if eventType == "citationEvent" {
+			var event struct {
+				Citations []struct {
+					Title   string `json:"title"`
+					URL     string `json:"url"`
+					Content string `json:"content"`
+				} `json:"citations"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil && len(event.Citations) > 0 {
+				var cites []string
+				for i, c := range event.Citations {
+					var parts []string
+					parts = append(parts, fmt.Sprintf("[%d]", i+1))
+					if c.Title != "" {
+						parts = append(parts, c.Title)
+					}
+					if c.URL != "" {
+						parts = append(parts, fmt.Sprintf("(%s)", c.URL))
+					}
+					cites = append(cites, strings.Join(parts, " "))
+				}
+				if len(cites) > 0 {
+					callback("\n\n📖 **Citations:**\n"+strings.Join(cites, "\n"), nil, false, false)
+				}
+			}
+		}
+
+		// 解析 contextUsageEvent（上下文使用百分比）
+		if eventType == "contextUsageEvent" {
+			var event struct {
+				ContextUsagePercentage float64 `json:"contextUsagePercentage"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil {
+				// 上下文使用率超过 80% 时警告
+				if event.ContextUsagePercentage > 80 {
+					callback(fmt.Sprintf("\n\n⚠️ Context usage high: %.1f%%", event.ContextUsagePercentage), nil, false, false)
+				}
+			}
+		}
+
+		// 解析 invalidStateEvent（无效状态事件）
+		if eventType == "invalidStateEvent" {
+			var event struct {
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil {
+				msg := event.Message
+				if msg == "" {
+					msg = "Invalid state detected"
+				}
+				callback(fmt.Sprintf("\n\n⚠️ **Warning:** %s (reason: %s)", msg, event.Reason), nil, false, false)
+			}
+		}
+
 		// 解析 toolUseEvent（工具调用）
 		if eventType == "toolUseEvent" {
 			var event struct {
@@ -677,12 +1541,18 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 				// 如果是不同的工具调用，先完成前一个
 				if currentToolUse != nil && currentToolUse.ToolUseId != event.ToolUseId {
 					if !processedIds[currentToolUse.ToolUseId] {
-						input := parseToolInput(currentToolUse.InputBuffer)
-						callback("", &KiroToolUse{
-							ToolUseId: currentToolUse.ToolUseId,
-							Name:      currentToolUse.Name,
-							Input:     input,
-						}, false)
+						input, ok := parseToolInput(currentToolUse.InputBuffer)
+						if ok {
+							callback("", &KiroToolUse{
+								ToolUseId: currentToolUse.ToolUseId,
+								Name:      currentToolUse.Name,
+								Input:     input,
+							}, false, false)
+						} else {
+							// 无法解析，发送跳过通知并记录日志
+							callback(fmt.Sprintf("\n\n⚠️ Tool \"%s\" was skipped: input truncated by Kiro API (output token limit exceeded)", currentToolUse.Name), nil, false, false)
+							logToolSkipped(currentToolUse.Name, currentToolUse.InputBuffer)
+						}
 						processedIds[currentToolUse.ToolUseId] = true
 					}
 					currentToolUse = nil
@@ -713,12 +1583,18 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 
 			// 工具调用完成
 			if event.Stop && currentToolUse != nil {
-				input := parseToolInput(currentToolUse.InputBuffer)
-				callback("", &KiroToolUse{
-					ToolUseId: currentToolUse.ToolUseId,
-					Name:      currentToolUse.Name,
-					Input:     input,
-				}, false)
+				input, ok := parseToolInput(currentToolUse.InputBuffer)
+				if ok {
+					callback("", &KiroToolUse{
+						ToolUseId: currentToolUse.ToolUseId,
+						Name:      currentToolUse.Name,
+						Input:     input,
+					}, false, false)
+				} else {
+					// 无法解析，发送跳过通知并记录日志
+					callback(fmt.Sprintf("\n\n⚠️ Tool \"%s\" was skipped: input truncated by Kiro API (output token limit exceeded)", currentToolUse.Name), nil, false, false)
+					logToolSkipped(currentToolUse.Name, currentToolUse.InputBuffer)
+				}
 				processedIds[currentToolUse.ToolUseId] = true
 				currentToolUse = nil
 			}
@@ -727,18 +1603,67 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 }
 
 // parseToolInput 解析工具输入 JSON
-func parseToolInput(buffer string) map[string]interface{} {
+// 返回值：
+//   - result: 解析后的 map，如果无法解析则为 nil
+//   - ok: 是否成功解析（包括修复后成功）
+//
+// 当 ok=false 时，调用方应跳过该工具调用，不再返回包含 _error 和 _partialInput 的错误 map
+// Requirements: 2.4, 3.1, 3.2, 6.1, 6.2, 6.3
+func parseToolInput(buffer string) (map[string]interface{}, bool) {
+	// 空字符串返回空 map 和 true（向后兼容）
 	if buffer == "" {
-		return make(map[string]interface{})
+		return make(map[string]interface{}), true
 	}
+
+	// 尝试标准 JSON 解析
 	var input map[string]interface{}
-	if err := json.Unmarshal([]byte(buffer), &input); err != nil {
-		return map[string]interface{}{
-			"_error":        "Tool input parse failed",
-			"_partialInput": buffer,
-		}
+	if err := json.Unmarshal([]byte(buffer), &input); err == nil {
+		// 解析成功，返回结果
+		return input, true
 	}
-	return input
+
+	// JSON 解析失败，检测是否是截断
+	truncType, _ := detectTruncation(buffer)
+
+	// 非截断情况（语法错误），无法修复
+	if truncType == TruncationNone {
+		return nil, false
+	}
+
+	// 尝试修复截断的 JSON
+	fixed, ok := fixTruncatedJSON(buffer, truncType)
+	if !ok {
+		// 修复失败，返回 nil 表示跳过
+		return nil, false
+	}
+
+	// 修复成功，解析修复后的 JSON
+	var fixedInput map[string]interface{}
+	if err := json.Unmarshal([]byte(fixed), &fixedInput); err != nil {
+		// 修复后仍无法解析，返回 nil 表示跳过
+		return nil, false
+	}
+
+	// 修复成功，返回修复后的结果
+	return fixedInput, true
+}
+
+// logToolSkipped 记录工具调用被跳过的日志
+// 用于调试和监控截断问题
+// Requirements: 5.1, 5.2, 5.3
+func logToolSkipped(toolName string, inputBuffer string) {
+	// 检测截断类型
+	truncType, truncPos := detectTruncation(inputBuffer)
+
+	// 截断部分输入到 500 字符，便于日志记录
+	partialInput := inputBuffer
+	if len(partialInput) > 500 {
+		partialInput = partialInput[:500] + "..."
+	}
+
+	// 记录日志，格式符合设计文档要求
+	log.Printf("[TOOL_SKIP] Tool \"%s\" skipped: truncation_type=%s, truncation_pos=%d, partial_input=\"%s\"",
+		toolName, truncType.String(), truncPos, partialInput)
 }
 
 // buildKiroMessages 构建 Kiro API 格式的消息

@@ -323,6 +323,97 @@ go run chat_example.go
 
 ---
 
+## Kiro-account-manager 对齐记录
+
+### 2026-02-05 对齐更新
+
+参考项目: [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)
+
+#### 已对齐功能
+
+| 功能 | Kiro-account-manager | kiro-api-client-go | 状态 |
+|------|---------------------|-------------------|------|
+| `parseToolInput` 错误处理 | 返回 `_error`/`_partialInput` | ✅ 已实现 | 完成 |
+| `ToolUseCallback` 签名 | 包含 `isThinking` 参数 | ✅ 已实现 | 完成 |
+| `reasoningContentEvent` 处理 | 支持 thinking 模式 | ✅ 已实现 | 完成 |
+| `supplementaryWebLinksEvent` | 网页链接引用 | ✅ 已实现 | 完成 |
+| `codeReferenceEvent` | 代码引用/许可证 | ✅ 已实现 | 完成 |
+| `followupPromptEvent` | 后续提示建议 | ✅ 已实现 | 完成 |
+| `citationEvent` | 引用事件 | ✅ 已实现 | 完成 |
+| `contextUsageEvent` | 上下文使用警告 | ✅ 已实现 | 完成 |
+| `invalidStateEvent` | 无效状态警告 | ✅ 已实现 | 完成 |
+| `<thinking>` 标签检测 | `processText()` 函数 | ✅ 已实现 | 完成 |
+| `thinkingOutputFormat` 配置 | `reasoning_content`/`<thinking>`/`<think>` | ✅ 已实现 | 完成 |
+| `ProxyConfig` 配置 | thinking 模式配置 | ✅ 已实现 | 完成 |
+
+#### 新增类型 (types.go)
+
+```go
+// ThinkingOutputFormat thinking 输出格式
+type ThinkingOutputFormat string
+
+const (
+    ThinkingFormatReasoningContent ThinkingOutputFormat = "reasoning_content"
+    ThinkingFormatThinking         ThinkingOutputFormat = "thinking"
+    ThinkingFormatThink            ThinkingOutputFormat = "think"
+)
+
+// ProxyConfig 代理服务器配置
+type ProxyConfig struct {
+    ThinkingOutputFormat ThinkingOutputFormat `json:"thinkingOutputFormat"`
+    AutoContinueRounds   int                  `json:"autoContinueRounds"`
+    ModelThinkingMode    map[string]bool      `json:"modelThinkingMode"`
+}
+```
+
+#### 新增功能 (chat.go)
+
+```go
+// ThinkingTextProcessor 处理文本中的 <thinking> 标签
+// 参考 Kiro-account-manager proxyServer.ts 的 processText 函数
+type ThinkingTextProcessor struct {
+    buffer          string
+    inThinkingBlock bool
+    format          ThinkingOutputFormat
+    Callback        func(text string, isThinking bool)
+}
+
+// ProcessText 处理文本，检测并转换 <thinking> 标签
+func (p *ThinkingTextProcessor) ProcessText(text string, forceFlush bool)
+
+// Flush 刷新缓冲区中剩余的内容
+func (p *ThinkingTextProcessor) Flush()
+```
+
+#### 新增 API 端点 (server/main.go)
+
+- `GET /api/proxy-config` - 获取代理配置
+- `POST /api/proxy-config` - 更新代理配置
+
+#### 配置文件
+
+新增 `proxy-config.json` 配置文件：
+
+```json
+{
+  "thinkingOutputFormat": "reasoning_content",
+  "autoContinueRounds": 0,
+  "modelThinkingMode": {}
+}
+```
+
+#### 待实现功能（可选）
+
+| 功能 | 说明 | 优先级 |
+|------|------|--------|
+| `autoContinueRounds` | 自动继续工具调用轮次 | 低 |
+| `callWithRetry` | 带重试的 API 调用 | 中 |
+| `syncKProxyDeviceId` | K-Proxy 设备 ID 同步 | 低 |
+| `recordApiKeyUsage` | API Key 用量追踪 | 低 |
+| 高级模型映射 | replace/alias/loadbalance 模式 | 中 |
+
+---
+
 ## 部署就绪
 
 项目已经可以直接部署使用：

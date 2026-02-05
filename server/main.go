@@ -136,6 +136,11 @@ var modelMappingFile = "model-mapping.json"
 var apiKeysFile = "api-keys.json"
 var apiKeys []string // API-KEY 列表（支持 Claude X-API-Key 和 OpenAI Bearer Token）
 
+// ========== Thinking 模式配置 ==========
+// 参考 Kiro-account-manager proxyServer.ts 的 thinkingOutputFormat 配置
+var proxyConfigFile = "proxy-config.json"
+var proxyConfig = kiroclient.DefaultProxyConfig
+
 // ========== 全局结构化日志记录器 ==========
 var logger *StructuredLogger
 
@@ -898,6 +903,9 @@ func main() {
 	// 加载模型映射配置
 	loadModelMapping()
 
+	// 加载代理配置（thinking 模式等）
+	loadProxyConfig()
+
 	// 加载 API-KEY 配置
 	loadApiKeys()
 
@@ -972,6 +980,10 @@ func main() {
 		// 模型映射管理
 		api.GET("/model-mapping", handleGetModelMapping)
 		api.POST("/model-mapping", handleUpdateModelMapping)
+
+		// 代理配置管理（thinking 模式等）
+		api.GET("/proxy-config", handleGetProxyConfig)
+		api.POST("/proxy-config", handleUpdateProxyConfig)
 
 		// 账号管理（登录流程）
 		api.POST("/auth/start", handleStartLogin)
@@ -1407,12 +1419,12 @@ func handleClaudeChat(c *gin.Context) {
 	}
 
 	// 转换消息格式（支持 system、tools、tool_use、tool_result）
-	messages, tools, toolResults := convertToKiroMessagesWithSystem(req.Messages, req.System, req.Tools)
+	messages, tools, toolResults, toolNameMap := convertToKiroMessagesWithSystem(req.Messages, req.System, req.Tools)
 
 	if req.Stream {
-		handleStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model)
+		handleStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model, toolNameMap)
 	} else {
-		handleNonStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model)
+		handleNonStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model, toolNameMap)
 	}
 }
 
@@ -1516,17 +1528,18 @@ func convertToKiroMessages(messages []map[string]any) []kiroclient.ChatMessage {
 }
 
 // convertToKiroMessagesWithSystem 转换消息格式（支持 system 和 tools）
-// 返回：messages, tools, lastToolResults（只返回最后一条 user 消息的 toolResults）
+// 返回：messages, tools, lastToolResults, toolNameMap
 // 参考 Kiro-account-manager/translator.ts 的 claudeToKiro 实现
-func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tools any) ([]kiroclient.ChatMessage, []kiroclient.KiroToolWrapper, []kiroclient.KiroToolResult) {
+func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tools any) ([]kiroclient.ChatMessage, []kiroclient.KiroToolWrapper, []kiroclient.KiroToolResult, map[string]string) {
 	var kiroMessages []kiroclient.ChatMessage
 	var kiroTools []kiroclient.KiroToolWrapper
+	var toolNameMap map[string]string
 
 	// 提取 system prompt（将合并到最后一条 user 消息）
 	systemPrompt := extractSystemPrompt(system)
 
-	// 转换 tools
-	kiroTools = convertClaudeTools(tools)
+	// 转换 tools（返回工具名映射表）
+	kiroTools, toolNameMap = convertClaudeTools(tools)
 
 	for _, msg := range messages {
 		role, _ := msg["role"].(string)
@@ -1673,7 +1686,7 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 		}
 	}
 
-	return kiroMessages, kiroTools, lastToolResults
+	return kiroMessages, kiroTools, lastToolResults, toolNameMap
 }
 
 // extractSystemPrompt 提取 system prompt
@@ -1699,29 +1712,45 @@ func extractSystemPrompt(system any) string {
 	return ""
 }
 
+// sanitizeToolName 清理工具名（Kiro API 只支持字母、数字、下划线、连字符）
+// 将不支持的分隔符替换为下划线：. / : @ # $ % & * + = | \ ~ ` ! ^ ( ) [ ] { } < > , ; ? ' "
+// 返回清理后的名称
+func sanitizeToolName(name string) string {
+	// 需要替换的特殊字符列表
+	chars := []string{".", "/", ":", "@", "#", "$", "%", "&", "*", "+", "=", "|", "\\", "~", "`", "!", "^", "(", ")", "[", "]", "{", "}", "<", ">", ",", ";", "?", "'", "\"", " "}
+	result := name
+	for _, c := range chars {
+		result = strings.ReplaceAll(result, c, "_")
+	}
+	return result
+}
+
 // convertClaudeTools 转换 Claude tools 到 Kiro 格式
-func convertClaudeTools(tools any) []kiroclient.KiroToolWrapper {
+// 返回：kiroTools, toolNameMap（sanitized -> original）
+func convertClaudeTools(tools any) ([]kiroclient.KiroToolWrapper, map[string]string) {
 	if tools == nil {
-		return nil
+		return nil, nil
 	}
 
 	toolsSlice, ok := tools.([]interface{})
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	var kiroTools []kiroclient.KiroToolWrapper
+	toolNameMap := make(map[string]string)
+
 	for _, t := range toolsSlice {
 		tool, ok := t.(map[string]interface{})
 		if !ok {
 			continue
 		}
 
-		name, _ := tool["name"].(string)
+		originalName, _ := tool["name"].(string)
 		description, _ := tool["description"].(string)
 		inputSchema, _ := tool["input_schema"].(map[string]interface{})
 
-		if name == "" {
+		if originalName == "" {
 			continue
 		}
 
@@ -1730,21 +1759,29 @@ func convertClaudeTools(tools any) []kiroclient.KiroToolWrapper {
 			description = description[:10237] + "..."
 		}
 
+		// 清理工具名（替换点号为下划线）
+		sanitizedName := sanitizeToolName(originalName)
+
 		// 截断过长的工具名（Kiro API 限制 64 字符）
-		if len(name) > 64 {
-			name = name[:64]
+		if len(sanitizedName) > 64 {
+			sanitizedName = sanitizedName[:64]
+		}
+
+		// 记录映射关系（用于响应时还原）
+		if sanitizedName != originalName {
+			toolNameMap[sanitizedName] = originalName
 		}
 
 		kiroTools = append(kiroTools, kiroclient.KiroToolWrapper{
 			ToolSpecification: kiroclient.KiroToolSpecification{
-				Name:        name,
+				Name:        sanitizedName,
 				Description: description,
 				InputSchema: inputSchema,
 			},
 		})
 	}
 
-	return kiroTools
+	return kiroTools, toolNameMap
 }
 
 // extractToolResultContent 提取工具结果内容
@@ -2107,7 +2144,8 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 
 // handleStreamResponseWithTools 处理流式响应（支持工具调用）
 // 使用 ChatStreamWithToolsAndUsage 获取 Kiro API 返回的精确 token 使用量
-func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string) {
+// 参考 Kiro-account-manager proxyServer.ts 的 handleOpenAIStream/handleClaudeStream
+func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string, toolNameMap map[string]string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -2153,9 +2191,67 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 	// 保存估算的 outputTokens（用于 message_delta 事件）
 	var estimatedOutputTokens int
 
+	// 创建 thinking 文本处理器
+	// 参考 Kiro-account-manager proxyServer.ts 的 processText 函数
+	thinkingProcessor := kiroclient.NewThinkingTextProcessor(proxyConfig.ThinkingOutputFormat, func(text string, isThinking bool) {
+		if text == "" {
+			return
+		}
+
+		// 如果还没开始文本块，先发送 content_block_start
+		if !textBlockStarted {
+			blockStart := map[string]any{
+				"type":  "content_block_start",
+				"index": contentBlockIndex,
+				"content_block": map[string]any{
+					"type": "text",
+					"text": "",
+				},
+			}
+			data, _ := json.Marshal(blockStart)
+			fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+			textBlockStarted = true
+			contentBlockIndex++
+		}
+
+		outputBuilder.WriteString(text)
+
+		// 发送 content_block_delta
+		// 如果是 reasoning_content 格式且 isThinking=true，使用 reasoning_content 字段
+		if isThinking && proxyConfig.ThinkingOutputFormat == kiroclient.ThinkingFormatReasoningContent {
+			// OpenAI 格式的 reasoning_content
+			chunk := map[string]any{
+				"type":  "content_block_delta",
+				"index": contentBlockIndex - 1,
+				"delta": map[string]any{
+					"type":              "text_delta",
+					"reasoning_content": text,
+				},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+		} else {
+			// 普通文本或已转换的 <thinking>/<think> 标签
+			chunk := map[string]any{
+				"type":  "content_block_delta",
+				"index": contentBlockIndex - 1,
+				"delta": map[string]string{
+					"type": "text_delta",
+					"text": text,
+				},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+		}
+		flusher.Flush()
+	})
+
 	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
-	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
+	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
 		if done {
+			// 刷新 thinking 处理器缓冲区
+			thinkingProcessor.Flush()
+
 			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
 			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
@@ -2199,40 +2295,31 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 		// 处理文本内容
 		if content != "" {
-			// 如果还没开始文本块，先发送 content_block_start
-			if !textBlockStarted {
-				blockStart := map[string]any{
-					"type":  "content_block_start",
-					"index": contentBlockIndex,
-					"content_block": map[string]any{
-						"type": "text",
-						"text": "",
-					},
+			if isThinking {
+				// reasoningContentEvent 的思考内容
+				// 根据 thinkingOutputFormat 配置处理
+				switch proxyConfig.ThinkingOutputFormat {
+				case kiroclient.ThinkingFormatThinking:
+					// 保持原始 <thinking> 标签
+					thinkingProcessor.Callback("<thinking>"+content+"</thinking>", false)
+				case kiroclient.ThinkingFormatThink:
+					// 转换为 <think> 标签
+					thinkingProcessor.Callback("<think>"+content+"</think>", false)
+				default:
+					// reasoning_content 格式
+					thinkingProcessor.Callback(content, true)
 				}
-				data, _ := json.Marshal(blockStart)
-				fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
-				textBlockStarted = true
-				contentBlockIndex++
+			} else {
+				// 普通文本，通过 processText 检测 <thinking> 标签
+				thinkingProcessor.ProcessText(content, false)
 			}
-
-			outputBuilder.WriteString(content)
-
-			// 发送 content_block_delta
-			chunk := map[string]any{
-				"type":  "content_block_delta",
-				"index": contentBlockIndex - 1,
-				"delta": map[string]string{
-					"type": "text_delta",
-					"text": content,
-				},
-			}
-			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
-			flusher.Flush()
 		}
 
 		// 处理工具调用
 		if toolUse != nil {
+			// 刷新 thinking 处理器缓冲区
+			thinkingProcessor.Flush()
+
 			// 关闭之前的文本块
 			if textBlockStarted {
 				blockStop := map[string]any{
@@ -2244,6 +2331,12 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				textBlockStarted = false
 			}
 
+			// 还原工具名（如果有映射）
+			toolName := toolUse.Name
+			if originalName, ok := toolNameMap[toolName]; ok {
+				toolName = originalName
+			}
+
 			// 发送 tool_use content_block_start
 			blockStart := map[string]any{
 				"type":  "content_block_start",
@@ -2251,7 +2344,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				"content_block": map[string]any{
 					"type":  "tool_use",
 					"id":    toolUse.ToolUseId,
-					"name":  toolUse.Name,
+					"name":  toolName,
 					"input": map[string]any{},
 				},
 			}
@@ -2320,7 +2413,8 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 // handleNonStreamResponseWithTools 处理非流式响应（支持工具调用）
 // 使用 ChatStreamWithToolsAndUsage 获取 Kiro API 返回的精确 token 使用量
-func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string) {
+// toolNameMap: 净化后的工具名 -> 原始工具名的映射，用于恢复带点的工具名
+func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string, toolNameMap map[string]string) {
 	// 本地估算的 inputTokens（降级使用）
 	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 
@@ -2328,7 +2422,7 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	var toolUses []*kiroclient.KiroToolUse
 
 	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
-	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
+	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
 		if content != "" {
 			responseText.WriteString(content)
 		}
@@ -2380,10 +2474,15 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 
 	// 添加工具调用块
 	for _, tu := range toolUses {
+		// 恢复原始工具名（如果有映射）
+		toolName := tu.Name
+		if originalName, ok := toolNameMap[tu.Name]; ok {
+			toolName = originalName
+		}
 		contentBlocks = append(contentBlocks, map[string]any{
 			"type":  "tool_use",
 			"id":    tu.ToolUseId,
-			"name":  tu.Name,
+			"name":  toolName,
 			"input": tu.Input,
 		})
 	}
@@ -2444,6 +2543,98 @@ func loadModelMapping() {
 	}
 
 	modelMapping = mapping
+}
+
+// loadProxyConfig 从文件加载代理配置（thinking 模式等）
+// 参考 Kiro-account-manager proxyServer.ts 的 ProxyConfig
+func loadProxyConfig() {
+	data, err := os.ReadFile(proxyConfigFile)
+	if err != nil {
+		// 文件不存在，使用默认配置
+		proxyConfig = kiroclient.DefaultProxyConfig
+		if logger != nil {
+			logger.Info("", "代理配置: 使用默认值", nil)
+		}
+		return
+	}
+
+	var cfg kiroclient.ProxyConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		proxyConfig = kiroclient.DefaultProxyConfig
+		return
+	}
+
+	// 确保 ModelThinkingMode 不为 nil
+	if cfg.ModelThinkingMode == nil {
+		cfg.ModelThinkingMode = make(map[string]bool)
+	}
+
+	proxyConfig = cfg
+	if logger != nil {
+		logger.Info("", "代理配置已加载", map[string]any{
+			"thinkingOutputFormat": cfg.ThinkingOutputFormat,
+			"autoContinueRounds":   cfg.AutoContinueRounds,
+		})
+	}
+}
+
+// saveProxyConfig 保存代理配置到文件
+func saveProxyConfig() error {
+	data, err := json.MarshalIndent(proxyConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(proxyConfigFile, data, 0644)
+}
+
+// handleGetProxyConfig 获取代理配置
+func handleGetProxyConfig(c *gin.Context) {
+	data, _ := json.Marshal(proxyConfig)
+	hash := computeHash(data)
+	c.JSON(200, gin.H{
+		"config": proxyConfig,
+		"hash":   hash,
+	})
+}
+
+// handleUpdateProxyConfig 更新代理配置
+func handleUpdateProxyConfig(c *gin.Context) {
+	var req struct {
+		Config kiroclient.ProxyConfig `json:"config"`
+		Hash   string                 `json:"hash"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 乐观锁校验
+	if req.Hash != "" {
+		currentData, _ := json.Marshal(proxyConfig)
+		currentHash := computeHash(currentData)
+		if req.Hash != currentHash {
+			c.JSON(409, gin.H{"error": "配置已被修改，请刷新后重试"})
+			return
+		}
+	}
+
+	// 确保 ModelThinkingMode 不为 nil
+	if req.Config.ModelThinkingMode == nil {
+		req.Config.ModelThinkingMode = make(map[string]bool)
+	}
+
+	proxyConfig = req.Config
+	if err := saveProxyConfig(); err != nil {
+		if logger != nil {
+			RecordError(c, logger, err, "")
+		}
+		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
+		return
+	}
+
+	newData, _ := json.Marshal(proxyConfig)
+	newHash := computeHash(newData)
+	c.JSON(200, gin.H{"message": "代理配置已更新", "hash": newHash})
 }
 
 // saveModelMapping 保存模型映射配置到文件

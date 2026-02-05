@@ -483,6 +483,39 @@ type KiroUsage struct {
 	Credits          float64 `json:"credits"`          // 消耗的 credits
 }
 
+// ========== Thinking 模式配置 ==========
+
+// ThinkingOutputFormat thinking 输出格式
+// 参考 Kiro-account-manager proxyServer.ts 的 thinkingOutputFormat 配置
+type ThinkingOutputFormat string
+
+const (
+	// ThinkingFormatReasoningContent 使用 OpenAI 格式的 reasoning_content 字段
+	ThinkingFormatReasoningContent ThinkingOutputFormat = "reasoning_content"
+	// ThinkingFormatThinking 保持原始 <thinking> 标签
+	ThinkingFormatThinking ThinkingOutputFormat = "thinking"
+	// ThinkingFormatThink 转换为 <think> 标签
+	ThinkingFormatThink ThinkingOutputFormat = "think"
+)
+
+// ProxyConfig 代理服务器配置
+// 参考 Kiro-account-manager proxyServer.ts 的 ProxyConfig
+type ProxyConfig struct {
+	// ThinkingOutputFormat thinking 内容输出格式
+	ThinkingOutputFormat ThinkingOutputFormat `json:"thinkingOutputFormat"`
+	// AutoContinueRounds 自动继续工具调用的轮次（0=禁用）
+	AutoContinueRounds int `json:"autoContinueRounds"`
+	// ModelThinkingMode 每个模型是否默认启用 thinking 模式
+	ModelThinkingMode map[string]bool `json:"modelThinkingMode"`
+}
+
+// DefaultProxyConfig 默认代理配置
+var DefaultProxyConfig = ProxyConfig{
+	ThinkingOutputFormat: ThinkingFormatReasoningContent,
+	AutoContinueRounds:   0,
+	ModelThinkingMode:    make(map[string]bool),
+}
+
 // ========== MCP 工具调用相关类型 ==========
 
 // KiroToolWrapper Kiro API 工具包装器
