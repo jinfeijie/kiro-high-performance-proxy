@@ -83,7 +83,10 @@ func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model 
 			userMsg := map[string]any{
 				"content": msg.Content,
 				"origin":  "AI_EDITOR",
-				"modelId": model,
+			}
+			// 只有 model 非空时才添加 modelId
+			if model != "" {
+				userMsg["modelId"] = model
 			}
 			// 如果有图片，添加到消息中
 			if len(msg.Images) > 0 {
@@ -117,7 +120,10 @@ func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model 
 		userMsg := map[string]any{
 			"content": lastMsg.Content,
 			"origin":  "AI_EDITOR",
-			"modelId": model,
+		}
+		// 只有 model 非空时才添加 modelId
+		if model != "" {
+			userMsg["modelId"] = model
 		}
 		// 如果有图片，添加到消息中
 		if len(lastMsg.Images) > 0 {
@@ -1011,7 +1017,11 @@ func (s *ChatService) convertToKiroHistoryMessage(msg ChatMessage, model string)
 		userMsg := map[string]any{
 			"content": msg.Content,
 			"origin":  "AI_EDITOR",
-			"modelId": model,
+		}
+
+		// 只有 model 非空时才添加 modelId
+		if model != "" {
+			userMsg["modelId"] = model
 		}
 
 		// 添加图片
@@ -1080,7 +1090,11 @@ func (s *ChatService) buildCurrentMessage(
 	userMsg := map[string]any{
 		"content": msg.Content,
 		"origin":  "AI_EDITOR",
-		"modelId": model,
+	}
+
+	// 只有 model 非空时才添加 modelId
+	if model != "" {
+		userMsg["modelId"] = model
 	}
 
 	// 添加图片
