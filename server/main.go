@@ -38,12 +38,20 @@ type OpenAIChatRequest struct {
 	Stream   bool             `json:"stream"`
 }
 
-// Claude 格式请求
+// Claude 格式请求（完整版，支持 MCP tools 透传）
 type ClaudeChatRequest struct {
-	Model     string           `json:"model"`
-	Messages  []map[string]any `json:"messages"`
-	MaxTokens int              `json:"max_tokens"`
-	Stream    bool             `json:"stream"`
+	Model         string           `json:"model"`
+	Messages      []map[string]any `json:"messages"`
+	MaxTokens     int              `json:"max_tokens"`
+	Stream        bool             `json:"stream"`
+	System        any              `json:"system,omitempty"`
+	Tools         any              `json:"tools,omitempty"`
+	ToolChoice    any              `json:"tool_choice,omitempty"`
+	Temperature   *float64         `json:"temperature,omitempty"`
+	TopP          float64          `json:"top_p,omitempty"`
+	TopK          int              `json:"top_k,omitempty"`
+	StopSequences []string         `json:"stop_sequences,omitempty"`
+	Metadata      any              `json:"metadata,omitempty"`
 }
 
 // OpenAI 格式响应（完整版，对齐 new-api）
@@ -1158,13 +1166,13 @@ func handleClaudeChat(c *gin.Context) {
 		return
 	}
 
-	// 转换消息格式
-	messages := convertToKiroMessages(req.Messages)
+	// 转换消息格式，传入 system 和 tools 参数
+	messages, tools, toolResults := convertToKiroMessagesWithSystem(req.Messages, req.System, req.Tools)
 
 	if req.Stream {
-		handleStreamResponse(c, messages, "claude", req.Model)
+		handleStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model)
 	} else {
-		handleNonStreamResponse(c, messages, "claude", req.Model)
+		handleNonStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model)
 	}
 }
 
@@ -1265,6 +1273,226 @@ func convertToKiroMessages(messages []map[string]any) []kiroclient.ChatMessage {
 	}
 
 	return kiroMessages
+}
+
+// convertToKiroMessagesWithSystem 转换消息格式（支持 system 和 tools）
+// 返回：messages, tools, toolResults
+func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tools any) ([]kiroclient.ChatMessage, []kiroclient.KiroToolWrapper, []kiroclient.KiroToolResult) {
+	var kiroMessages []kiroclient.ChatMessage
+	var kiroTools []kiroclient.KiroToolWrapper
+	var kiroToolResults []kiroclient.KiroToolResult
+
+	// 提取 system prompt
+	systemPrompt := extractSystemPrompt(system)
+
+	// 转换 tools
+	kiroTools = convertClaudeTools(tools)
+
+	// 标记是否已合并 system prompt
+	systemMerged := false
+
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+
+		var content string
+		var images []kiroclient.ImageBlock
+
+		switch v := msg["content"].(type) {
+		case string:
+			content = v
+		case []interface{}:
+			for _, item := range v {
+				m, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				itemType, _ := m["type"].(string)
+
+				switch itemType {
+				case "text":
+					if text, ok := m["text"].(string); ok {
+						content += text
+					}
+
+				case "image_url":
+					if imgObj, ok := m["image_url"].(map[string]interface{}); ok {
+						if url, ok := imgObj["url"].(string); ok {
+							format, data, ok := kiroclient.ParseDataURL(url)
+							if ok {
+								if format == "jpg" {
+									format = "jpeg"
+								}
+								images = append(images, kiroclient.ImageBlock{
+									Format: format,
+									Source: kiroclient.ImageSource{Bytes: data},
+								})
+							}
+						}
+					}
+
+				case "image":
+					if source, ok := m["source"].(map[string]interface{}); ok {
+						sourceType, _ := source["type"].(string)
+						if sourceType != "base64" {
+							continue
+						}
+						mediaType, _ := source["media_type"].(string)
+						data, _ := source["data"].(string)
+						if mediaType == "" || data == "" {
+							continue
+						}
+						format := ""
+						if len(mediaType) > 6 && mediaType[:6] == "image/" {
+							format = mediaType[6:]
+						}
+						if format == "" {
+							continue
+						}
+						if format == "jpg" {
+							format = "jpeg"
+						}
+						images = append(images, kiroclient.ImageBlock{
+							Format: format,
+							Source: kiroclient.ImageSource{Bytes: data},
+						})
+					}
+
+				case "tool_result":
+					// Claude 格式的工具结果
+					toolUseId, _ := m["tool_use_id"].(string)
+					if toolUseId != "" {
+						resultContent := extractToolResultContent(m["content"])
+						kiroToolResults = append(kiroToolResults, kiroclient.KiroToolResult{
+							ToolUseId: toolUseId,
+							Content:   []kiroclient.KiroToolContent{{Text: resultContent}},
+							Status:    "success",
+						})
+					}
+
+				case "tool_use":
+					// Claude 格式的工具调用（assistant 消息中）
+					// 这里不需要处理，因为是 assistant 的响应
+				}
+			}
+		}
+
+		// 第一条 user 消息合并 system prompt
+		if role == "user" && !systemMerged && systemPrompt != "" {
+			content = systemPrompt + "\n\n" + content
+			systemMerged = true
+		}
+
+		kiroMessages = append(kiroMessages, kiroclient.ChatMessage{
+			Role:    role,
+			Content: content,
+			Images:  images,
+		})
+	}
+
+	// 如果没有 user 消息但有 system prompt，创建一个
+	if !systemMerged && systemPrompt != "" && len(kiroMessages) == 0 {
+		kiroMessages = append(kiroMessages, kiroclient.ChatMessage{
+			Role:    "user",
+			Content: systemPrompt,
+		})
+	}
+
+	return kiroMessages, kiroTools, kiroToolResults
+}
+
+// extractSystemPrompt 提取 system prompt
+func extractSystemPrompt(system any) string {
+	if system == nil {
+		return ""
+	}
+
+	switch v := system.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, item := range v {
+			if m, ok := item.(map[string]interface{}); ok {
+				if text, ok := m["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
+// convertClaudeTools 转换 Claude tools 到 Kiro 格式
+func convertClaudeTools(tools any) []kiroclient.KiroToolWrapper {
+	if tools == nil {
+		return nil
+	}
+
+	toolsSlice, ok := tools.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var kiroTools []kiroclient.KiroToolWrapper
+	for _, t := range toolsSlice {
+		tool, ok := t.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		name, _ := tool["name"].(string)
+		description, _ := tool["description"].(string)
+		inputSchema, _ := tool["input_schema"].(map[string]interface{})
+
+		if name == "" {
+			continue
+		}
+
+		// 截断过长的描述（Kiro API 限制）
+		if len(description) > 10237 {
+			description = description[:10237] + "..."
+		}
+
+		// 截断过长的工具名（Kiro API 限制 64 字符）
+		if len(name) > 64 {
+			name = name[:64]
+		}
+
+		kiroTools = append(kiroTools, kiroclient.KiroToolWrapper{
+			ToolSpecification: kiroclient.KiroToolSpecification{
+				Name:        name,
+				Description: description,
+				InputSchema: inputSchema,
+			},
+		})
+	}
+
+	return kiroTools
+}
+
+// extractToolResultContent 提取工具结果内容
+func extractToolResultContent(content any) string {
+	if content == nil {
+		return ""
+	}
+
+	switch v := content.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, item := range v {
+			if m, ok := item.(map[string]interface{}); ok {
+				if text, ok := m["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "")
+	}
+	return fmt.Sprintf("%v", content)
 }
 
 // handleStreamResponse 处理流式响应
@@ -1531,6 +1759,259 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 		addTokenStats(inputTokens, outputTokens)
 		c.JSON(200, resp)
 	}
+}
+
+// handleStreamResponseWithTools 处理流式响应（支持工具调用）
+func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(500, gin.H{"error": "Streaming not supported"})
+		return
+	}
+
+	inputTokens := kiroclient.CountMessagesTokens(messages)
+	var outputBuilder strings.Builder
+	msgID := generateID("msg")
+	contentBlockIndex := 0
+
+	// Claude 格式：发送 message_start 事件
+	if format == "claude" {
+		msgStart := map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":    msgID,
+				"type":  "message",
+				"role":  "assistant",
+				"model": model,
+				"usage": map[string]int{
+					"input_tokens":  inputTokens,
+					"output_tokens": 0,
+				},
+			},
+		}
+		data, _ := json.Marshal(msgStart)
+		fmt.Fprintf(c.Writer, "event: message_start\ndata: %s\n\n", string(data))
+		flusher.Flush()
+	}
+
+	// 标记是否已发送文本块开始
+	textBlockStarted := false
+
+	err := client.Chat.ChatStreamWithTools(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
+		if done {
+			outputTokens := kiroclient.CountTokens(outputBuilder.String())
+
+			// 关闭文本块（如果已开始）
+			if textBlockStarted {
+				blockStop := map[string]any{
+					"type":  "content_block_stop",
+					"index": contentBlockIndex - 1,
+				}
+				data, _ := json.Marshal(blockStop)
+				fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+			}
+
+			// 发送 message_delta 事件
+			stopReason := "end_turn"
+			if contentBlockIndex > 0 {
+				// 如果有工具调用，stop_reason 为 tool_use
+				stopReason = "tool_use"
+			}
+			msgDelta := map[string]any{
+				"type": "message_delta",
+				"delta": map[string]any{
+					"stop_reason":   stopReason,
+					"stop_sequence": nil,
+				},
+				"usage": map[string]int{
+					"output_tokens": outputTokens,
+				},
+			}
+			data, _ := json.Marshal(msgDelta)
+			fmt.Fprintf(c.Writer, "event: message_delta\ndata: %s\n\n", string(data))
+
+			// 发送 message_stop 事件
+			msgStop := map[string]any{"type": "message_stop"}
+			data, _ = json.Marshal(msgStop)
+			fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
+
+			addTokenStats(inputTokens, outputTokens)
+			flusher.Flush()
+			return
+		}
+
+		// 处理文本内容
+		if content != "" {
+			// 如果还没开始文本块，先发送 content_block_start
+			if !textBlockStarted {
+				blockStart := map[string]any{
+					"type":  "content_block_start",
+					"index": contentBlockIndex,
+					"content_block": map[string]any{
+						"type": "text",
+						"text": "",
+					},
+				}
+				data, _ := json.Marshal(blockStart)
+				fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+				textBlockStarted = true
+				contentBlockIndex++
+			}
+
+			outputBuilder.WriteString(content)
+
+			// 发送 content_block_delta
+			chunk := map[string]any{
+				"type":  "content_block_delta",
+				"index": contentBlockIndex - 1,
+				"delta": map[string]string{
+					"type": "text_delta",
+					"text": content,
+				},
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			flusher.Flush()
+		}
+
+		// 处理工具调用
+		if toolUse != nil {
+			// 关闭之前的文本块
+			if textBlockStarted {
+				blockStop := map[string]any{
+					"type":  "content_block_stop",
+					"index": contentBlockIndex - 1,
+				}
+				data, _ := json.Marshal(blockStop)
+				fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+				textBlockStarted = false
+			}
+
+			// 发送 tool_use content_block_start
+			blockStart := map[string]any{
+				"type":  "content_block_start",
+				"index": contentBlockIndex,
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    toolUse.ToolUseId,
+					"name":  toolUse.Name,
+					"input": map[string]any{},
+				},
+			}
+			data, _ := json.Marshal(blockStart)
+			fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+
+			// 发送 input_json_delta
+			inputJSON, _ := json.Marshal(toolUse.Input)
+			inputDelta := map[string]any{
+				"type":  "content_block_delta",
+				"index": contentBlockIndex,
+				"delta": map[string]any{
+					"type":         "input_json_delta",
+					"partial_json": string(inputJSON),
+				},
+			}
+			data, _ = json.Marshal(inputDelta)
+			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+
+			// 发送 content_block_stop
+			blockStop := map[string]any{
+				"type":  "content_block_stop",
+				"index": contentBlockIndex,
+			}
+			data, _ = json.Marshal(blockStop)
+			fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+
+			contentBlockIndex++
+			flusher.Flush()
+		}
+	})
+
+	if err != nil {
+		accountID := client.Auth.GetLastSelectedAccountID()
+		recordAccountRequest(accountID, 500, err.Error())
+		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
+		flusher.Flush()
+	} else {
+		accountID := client.Auth.GetLastSelectedAccountID()
+		recordAccountRequest(accountID, 200, "")
+	}
+}
+
+// handleNonStreamResponseWithTools 处理非流式响应（支持工具调用）
+func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string) {
+	inputTokens := kiroclient.CountMessagesTokens(messages)
+
+	var responseText strings.Builder
+	var toolUses []*kiroclient.KiroToolUse
+
+	err := client.Chat.ChatStreamWithTools(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool) {
+		if content != "" {
+			responseText.WriteString(content)
+		}
+		if toolUse != nil {
+			toolUses = append(toolUses, toolUse)
+		}
+	})
+
+	if err != nil {
+		accountID := client.Auth.GetLastSelectedAccountID()
+		recordAccountRequest(accountID, 500, err.Error())
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	accountID := client.Auth.GetLastSelectedAccountID()
+	recordAccountRequest(accountID, 200, "")
+
+	outputTokens := kiroclient.CountTokens(responseText.String())
+
+	// 构建 content 数组
+	var contentBlocks []map[string]any
+
+	// 添加文本块
+	if responseText.Len() > 0 {
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type": "text",
+			"text": responseText.String(),
+		})
+	}
+
+	// 添加工具调用块
+	for _, tu := range toolUses {
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type":  "tool_use",
+			"id":    tu.ToolUseId,
+			"name":  tu.Name,
+			"input": tu.Input,
+		})
+	}
+
+	// 确定 stop_reason
+	stopReason := "end_turn"
+	if len(toolUses) > 0 {
+		stopReason = "tool_use"
+	}
+
+	resp := map[string]any{
+		"id":          generateID("msg"),
+		"type":        "message",
+		"role":        "assistant",
+		"model":       model,
+		"stop_reason": stopReason,
+		"content":     contentBlocks,
+		"usage": map[string]int{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+		},
+	}
+
+	addTokenStats(inputTokens, outputTokens)
+	c.JSON(200, resp)
 }
 
 // handleModelsList 获取模型列表

@@ -470,6 +470,45 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// ========== MCP 工具调用相关类型 ==========
+
+// KiroToolWrapper Kiro API 工具包装器
+type KiroToolWrapper struct {
+	ToolSpecification KiroToolSpecification `json:"toolSpecification"`
+}
+
+// KiroToolSpecification Kiro API 工具规格
+type KiroToolSpecification struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	InputSchema map[string]interface{} `json:"inputSchema"`
+}
+
+// KiroToolResult Kiro API 工具结果
+type KiroToolResult struct {
+	ToolUseId string            `json:"toolUseId"`
+	Content   []KiroToolContent `json:"content"`
+	Status    string            `json:"status"` // "success" or "error"
+}
+
+// KiroToolContent 工具结果内容
+type KiroToolContent struct {
+	Text string `json:"text"`
+}
+
+// KiroToolUse Kiro API 工具调用
+type KiroToolUse struct {
+	ToolUseId string                 `json:"toolUseId"`
+	Name      string                 `json:"name"`
+	Input     map[string]interface{} `json:"input"`
+}
+
+// KiroUserInputMessageContext 用户输入消息上下文
+type KiroUserInputMessageContext struct {
+	Tools       []KiroToolWrapper `json:"tools,omitempty"`
+	ToolResults []KiroToolResult  `json:"toolResults,omitempty"`
+}
+
 // ========== 图片支持相关类型 ==========
 
 // ImageSource 图片源（Kiro API 格式）

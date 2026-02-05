@@ -393,3 +393,308 @@ func (s *ChatService) SimpleChatStream(prompt string, callback func(content stri
 		{Role: "user", Content: prompt},
 	}, callback)
 }
+
+// ToolUseCallback 工具调用回调（content 为文本，toolUse 为工具调用，done 为结束标志）
+type ToolUseCallback func(content string, toolUse *KiroToolUse, done bool)
+
+// ChatStreamWithTools 流式聊天（支持工具调用）
+func (s *ChatService) ChatStreamWithTools(
+	messages []ChatMessage,
+	model string,
+	tools []KiroToolWrapper,
+	toolResults []KiroToolResult,
+	callback ToolUseCallback,
+) error {
+	token, accountID, err := s.authManager.GetAccessTokenWithAccountID()
+	if err != nil {
+		token, err = s.authManager.GetAccessToken()
+		if err != nil {
+			return err
+		}
+		accountID = ""
+	}
+
+	if accountID != "" {
+		fmt.Printf("[轮询] 使用账号: %s\n", accountID[:8])
+	}
+
+	conversationID := generateConversationID()
+	history := make([]any, 0)
+
+	// 转换历史消息
+	for i := 0; i < len(messages)-1; i++ {
+		msg := messages[i]
+		switch msg.Role {
+		case "user":
+			userMsg := map[string]any{
+				"content": msg.Content,
+				"origin":  "AI_EDITOR",
+			}
+			if len(msg.Images) > 0 {
+				images := make([]map[string]any, 0, len(msg.Images))
+				for _, img := range msg.Images {
+					images = append(images, map[string]any{
+						"format": img.Format,
+						"source": map[string]any{"bytes": img.Source.Bytes},
+					})
+				}
+				userMsg["images"] = images
+			}
+			history = append(history, map[string]any{"userInputMessage": userMsg})
+		case "assistant":
+			history = append(history, map[string]any{
+				"assistantResponseMessage": map[string]any{"content": msg.Content},
+			})
+		}
+	}
+
+	// 构建当前消息
+	var currentMessage map[string]any
+	if len(messages) > 0 {
+		lastMsg := messages[len(messages)-1]
+		userMsg := map[string]any{
+			"content": lastMsg.Content,
+			"origin":  "AI_EDITOR",
+		}
+		if len(lastMsg.Images) > 0 {
+			images := make([]map[string]any, 0, len(lastMsg.Images))
+			for _, img := range lastMsg.Images {
+				images = append(images, map[string]any{
+					"format": img.Format,
+					"source": map[string]any{"bytes": img.Source.Bytes},
+				})
+			}
+			userMsg["images"] = images
+		}
+
+		// 添加 userInputMessageContext（tools 和 toolResults）
+		if len(tools) > 0 || len(toolResults) > 0 {
+			ctx := map[string]any{}
+			if len(tools) > 0 {
+				// 转换 tools 为 map 格式
+				toolsData := make([]map[string]any, 0, len(tools))
+				for _, t := range tools {
+					toolsData = append(toolsData, map[string]any{
+						"toolSpecification": map[string]any{
+							"name":        t.ToolSpecification.Name,
+							"description": t.ToolSpecification.Description,
+							"inputSchema": map[string]any{"json": t.ToolSpecification.InputSchema},
+						},
+					})
+				}
+				ctx["tools"] = toolsData
+			}
+			if len(toolResults) > 0 {
+				// 转换 toolResults 为 map 格式
+				resultsData := make([]map[string]any, 0, len(toolResults))
+				for _, r := range toolResults {
+					contentData := make([]map[string]any, 0, len(r.Content))
+					for _, c := range r.Content {
+						contentData = append(contentData, map[string]any{"text": c.Text})
+					}
+					resultsData = append(resultsData, map[string]any{
+						"toolUseId": r.ToolUseId,
+						"content":   contentData,
+						"status":    r.Status,
+					})
+				}
+				ctx["toolResults"] = resultsData
+			}
+			userMsg["userInputMessageContext"] = ctx
+		}
+
+		currentMessage = map[string]any{"userInputMessage": userMsg}
+	}
+
+	reqBody := map[string]any{
+		"conversationState": map[string]any{
+			"conversationId":  conversationID,
+			"currentMessage":  currentMessage,
+			"history":         history,
+			"chatTriggerType": "MANUAL",
+		},
+	}
+
+	if model != "" && IsValidModel(model) {
+		reqBody["customizationArn"] = model
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	region := s.authManager.GetRegion()
+	var endpoint string
+	if region == "eu-central-1" {
+		endpoint = "https://q.eu-central-1.amazonaws.com"
+	} else {
+		endpoint = "https://q.us-east-1.amazonaws.com"
+	}
+
+	url := endpoint + "/generateAssistantResponse"
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", fmt.Sprintf("KiroIDE %s %s", s.version, s.machineID))
+	req.Header.Set("X-Amz-User-Agent", "aws-sdk-js/3.x KiroIDE")
+	req.Header.Set("X-Amz-Date", time.Now().UTC().Format("20060102T150405Z"))
+	req.Header.Set("Accept", "application/vnd.amazon.eventstream")
+	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	req.Header.Set("x-amzn-kiro-agent-mode", "chat")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.authManager.RecordRequestResult(accountID, false)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		s.authManager.RecordRequestResult(accountID, false)
+		return fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	s.authManager.RecordRequestResult(accountID, true)
+
+	return s.parseEventStreamWithTools(resp.Body, callback)
+}
+
+// parseEventStreamWithTools 解析 EventStream（支持工具调用）
+func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUseCallback) error {
+	// 工具调用状态跟踪
+	var currentToolUse *struct {
+		ToolUseId   string
+		Name        string
+		InputBuffer string
+	}
+	processedIds := make(map[string]bool)
+
+	for {
+		msg, err := s.readEventStreamMessage(body)
+		if err != nil {
+			if err == io.EOF {
+				// 完成未处理的工具调用
+				if currentToolUse != nil && !processedIds[currentToolUse.ToolUseId] {
+					input := parseToolInput(currentToolUse.InputBuffer)
+					callback("", &KiroToolUse{
+						ToolUseId: currentToolUse.ToolUseId,
+						Name:      currentToolUse.Name,
+						Input:     input,
+					}, false)
+				}
+				callback("", nil, true)
+				return nil
+			}
+			return err
+		}
+
+		msgType := msg.Headers[":message-type"]
+		if msgType == "error" {
+			return fmt.Errorf("EventStream 错误: %s", msg.Headers[":error-message"])
+		}
+
+		if msgType != "event" {
+			continue
+		}
+
+		eventType := msg.Headers[":event-type"]
+
+		// 解析 assistantResponseEvent（文本内容）
+		if eventType == "assistantResponseEvent" {
+			var event struct {
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err == nil {
+				if event.Content != "" {
+					callback(event.Content, nil, false)
+				}
+			}
+		}
+
+		// 解析 toolUseEvent（工具调用）
+		if eventType == "toolUseEvent" {
+			var event struct {
+				ToolUseId string `json:"toolUseId"`
+				Name      string `json:"name"`
+				Input     any    `json:"input"`
+				Stop      bool   `json:"stop"`
+			}
+			if err := json.Unmarshal(msg.Payload, &event); err != nil {
+				continue
+			}
+
+			// 新的工具调用开始（只有当 currentToolUse 为空或 ID 不同时才创建）
+			if event.ToolUseId != "" && event.Name != "" {
+				// 如果是不同的工具调用，先完成前一个
+				if currentToolUse != nil && currentToolUse.ToolUseId != event.ToolUseId {
+					if !processedIds[currentToolUse.ToolUseId] {
+						input := parseToolInput(currentToolUse.InputBuffer)
+						callback("", &KiroToolUse{
+							ToolUseId: currentToolUse.ToolUseId,
+							Name:      currentToolUse.Name,
+							Input:     input,
+						}, false)
+						processedIds[currentToolUse.ToolUseId] = true
+					}
+					currentToolUse = nil
+				}
+				// 只有当 currentToolUse 为空时才创建新的
+				if currentToolUse == nil && !processedIds[event.ToolUseId] {
+					currentToolUse = &struct {
+						ToolUseId   string
+						Name        string
+						InputBuffer string
+					}{
+						ToolUseId: event.ToolUseId,
+						Name:      event.Name,
+					}
+				}
+			}
+
+			// 累积输入片段
+			if currentToolUse != nil {
+				switch v := event.Input.(type) {
+				case string:
+					currentToolUse.InputBuffer += v
+				case map[string]interface{}:
+					data, _ := json.Marshal(v)
+					currentToolUse.InputBuffer = string(data)
+				}
+			}
+
+			// 工具调用完成
+			if event.Stop && currentToolUse != nil {
+				input := parseToolInput(currentToolUse.InputBuffer)
+				callback("", &KiroToolUse{
+					ToolUseId: currentToolUse.ToolUseId,
+					Name:      currentToolUse.Name,
+					Input:     input,
+				}, false)
+				processedIds[currentToolUse.ToolUseId] = true
+				currentToolUse = nil
+			}
+		}
+	}
+}
+
+// parseToolInput 解析工具输入 JSON
+func parseToolInput(buffer string) map[string]interface{} {
+	if buffer == "" {
+		return make(map[string]interface{})
+	}
+	var input map[string]interface{}
+	if err := json.Unmarshal([]byte(buffer), &input); err != nil {
+		return map[string]interface{}{
+			"_error":        "Tool input parse failed",
+			"_partialInput": buffer,
+		}
+	}
+	return input
+}
