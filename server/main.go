@@ -1166,7 +1166,7 @@ func handleClaudeChat(c *gin.Context) {
 		return
 	}
 
-	// 转换消息格式，传入 system 和 tools 参数
+	// 转换消息格式（支持 system、tools、tool_use、tool_result）
 	messages, tools, toolResults := convertToKiroMessagesWithSystem(req.Messages, req.System, req.Tools)
 
 	if req.Stream {
@@ -1296,6 +1296,8 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 
 		var content string
 		var images []kiroclient.ImageBlock
+		var msgToolResults []kiroclient.KiroToolResult
+		var msgToolUses []kiroclient.KiroToolUse // 关键：提取 assistant 消息中的 tool_use
 
 		switch v := msg["content"].(type) {
 		case string:
@@ -1359,20 +1361,32 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 					}
 
 				case "tool_result":
-					// Claude 格式的工具结果
+					// Claude 格式的工具结果（在 user 消息中）
 					toolUseId, _ := m["tool_use_id"].(string)
 					if toolUseId != "" {
 						resultContent := extractToolResultContent(m["content"])
-						kiroToolResults = append(kiroToolResults, kiroclient.KiroToolResult{
+						tr := kiroclient.KiroToolResult{
 							ToolUseId: toolUseId,
 							Content:   []kiroclient.KiroToolContent{{Text: resultContent}},
 							Status:    "success",
-						})
+						}
+						msgToolResults = append(msgToolResults, tr)
+						kiroToolResults = append(kiroToolResults, tr)
 					}
 
 				case "tool_use":
-					// Claude 格式的工具调用（assistant 消息中）
-					// 这里不需要处理，因为是 assistant 的响应
+					// 关键修复：提取 assistant 消息中的 tool_use
+					// 这些需要放到 assistantResponseMessage.toolUses 中
+					toolUseId, _ := m["id"].(string)
+					toolName, _ := m["name"].(string)
+					toolInput, _ := m["input"].(map[string]interface{})
+					if toolUseId != "" && toolName != "" {
+						msgToolUses = append(msgToolUses, kiroclient.KiroToolUse{
+							ToolUseId: toolUseId,
+							Name:      toolName,
+							Input:     toolInput,
+						})
+					}
 				}
 			}
 		}
@@ -1383,10 +1397,22 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 			systemMerged = true
 		}
 
+		// 处理 user 消息中包含 tool_result 的情况
+		// 如果只有 tool_result 没有文本内容，添加占位内容
+		if role == "user" && len(msgToolResults) > 0 && content == "" {
+			content = "Here are the tool results."
+		}
+
+		// 跳过空内容的消息（但 assistant 有 tool_use 时不跳过）
+		if content == "" && len(images) == 0 && len(msgToolUses) == 0 {
+			continue
+		}
+
 		kiroMessages = append(kiroMessages, kiroclient.ChatMessage{
-			Role:    role,
-			Content: content,
-			Images:  images,
+			Role:     role,
+			Content:  content,
+			Images:   images,
+			ToolUses: msgToolUses, // 关键：填充 assistant 消息的 toolUses
 		})
 	}
 

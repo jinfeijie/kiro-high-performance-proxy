@@ -1,89 +1,61 @@
 {
   "13695d0307a73926": {
     "accountId": "13695d0307a73926",
-    "requestCount": 1,
+    "requestCount": 2,
     "successCount": 0,
-    "failCount": 1,
+    "failCount": 2,
     "statusCodes": {
-      "500": 1
+      "500": 2
     },
     "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 1
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 2
     },
-    "updatedAt": 1770258750
+    "updatedAt": 1770259740
   },
   "22e24ba72c7cb78f": {
     "accountId": "22e24ba72c7cb78f",
-    "requestCount": 6,
-    "successCount": 5,
-    "failCount": 1,
+    "requestCount": 11,
+    "successCount": 7,
+    "failCount": 4,
     "statusCodes": {
-      "200": 5,
-      "500": 1
+      "200": 7,
+      "500": 4
     },
     "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 1
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 4
     },
-    "updatedAt": 1770259393
+    "updatedAt": 1770260116
   },
   "671511701c243958": {
     "accountId": "671511701c243958",
-    "requestCount": 5,
-    "successCount": 4,
-    "failCount": 1,
+    "requestCount": 8,
+    "successCount": 5,
+    "failCount": 3,
     "statusCodes": {
-      "200": 4,
-      "500": 1
+      "200": 5,
+      "500": 3
     },
     "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 1
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 3
     },
-    "updatedAt": 1770258783
+    "updatedAt": 1770259938
   },
   "7ab839e2e759e8f7": {
     "accountId": "7ab839e2e759e8f7",
-    "requestCount": 7,
-    "successCount": 5,
-    "failCount": 2,
+    "requestCount": 10,
+    "successCount": 6,
+    "failCount": 4,
     "statusCodes": {
-      "200": 5,
-      "500": 2
+      "200": 6,
+      "500": 4
     },
     "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 2
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 4
     },
-    "updatedAt": 1770258897
+    "updatedAt": 1770259824
   },
   "c8a569c4390cba49": {
     "accountId": "c8a569c4390cba49",
-    "requestCount": 5,
-    "successCount": 4,
-    "failCount": 1,
-    "statusCodes": {
-      "200": 4,
-      "500": 1
-    },
-    "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 1
-    },
-    "updatedAt": 1770258756
-  },
-  "dd7dbb710df8339e": {
-    "accountId": "dd7dbb710df8339e",
-    "requestCount": 3,
-    "successCount": 1,
-    "failCount": 2,
-    "statusCodes": {
-      "200": 1,
-      "500": 2
-    },
-    "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 2
-    },
-    "updatedAt": 1770258859
-  },
-  "f0a4585ef2e742c0": {
-    "accountId": "f0a4585ef2e742c0",
     "requestCount": 6,
     "successCount": 4,
     "failCount": 2,
@@ -94,20 +66,48 @@
     "errors": {
       "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 2
     },
-    "updatedAt": 1770258822
+    "updatedAt": 1770259742
+  },
+  "dd7dbb710df8339e": {
+    "accountId": "dd7dbb710df8339e",
+    "requestCount": 4,
+    "successCount": 1,
+    "failCount": 3,
+    "statusCodes": {
+      "200": 1,
+      "500": 3
+    },
+    "errors": {
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 3
+    },
+    "updatedAt": 1770259783
+  },
+  "f0a4585ef2e742c0": {
+    "accountId": "f0a4585ef2e742c0",
+    "requestCount": 9,
+    "successCount": 5,
+    "failCount": 4,
+    "statusCodes": {
+      "200": 5,
+      "500": 4
+    },
+    "errors": {
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 4
+    },
+    "updatedAt": 1770259938
   },
   "fbdf1fa169462c28": {
     "accountId": "fbdf1fa169462c28",
-    "requestCount": 3,
+    "requestCount": 5,
     "successCount": 1,
-    "failCount": 2,
+    "failCount": 4,
     "statusCodes": {
       "200": 1,
-      "500": 2
+      "500": 4
     },
     "errors": {
-      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 2
+      "请求失败 [400]: {\"message\":\"Improperly formed request.\",\"reason\":null}": 4
     },
-    "updatedAt": 1770258931
+    "updatedAt": 1770259857
   }
 }

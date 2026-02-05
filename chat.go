@@ -13,11 +13,13 @@ import (
 	"time"
 )
 
-// ChatMessage 聊天消息（支持多模态）
+// ChatMessage 聊天消息（支持多模态和工具调用）
 type ChatMessage struct {
-	Role    string       `json:"role"`
-	Content string       `json:"content"`
-	Images  []ImageBlock `json:"images,omitempty"` // 图片列表（可选）
+	Role        string           `json:"role"`
+	Content     string           `json:"content"`
+	Images      []ImageBlock     `json:"images,omitempty"`      // 图片列表（可选）
+	ToolUses    []KiroToolUse    `json:"toolUses,omitempty"`    // assistant 消息中的工具调用
+	ToolResults []KiroToolResult `json:"toolResults,omitempty"` // user 消息中的工具结果
 }
 
 // ChatService 聊天服务
@@ -397,6 +399,35 @@ func (s *ChatService) SimpleChatStream(prompt string, callback func(content stri
 // ToolUseCallback 工具调用回调（content 为文本，toolUse 为工具调用，done 为结束标志）
 type ToolUseCallback func(content string, toolUse *KiroToolUse, done bool)
 
+// KiroHistoryMessage Kiro API 历史消息格式
+type KiroHistoryMessage struct {
+	UserInputMessage         *KiroUserInputMessage         `json:"userInputMessage,omitempty"`
+	AssistantResponseMessage *KiroAssistantResponseMessage `json:"assistantResponseMessage,omitempty"`
+}
+
+// KiroUserInputMessage Kiro API 用户输入消息
+type KiroUserInputMessage struct {
+	Content                 string                       `json:"content"`
+	Origin                  string                       `json:"origin"`
+	Images                  []map[string]any             `json:"images,omitempty"`
+	UserInputMessageContext *KiroUserInputMessageContext `json:"userInputMessageContext,omitempty"`
+}
+
+// KiroAssistantResponseMessage Kiro API 助手响应消息
+type KiroAssistantResponseMessage struct {
+	Content  string        `json:"content"`
+	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+}
+
+// ChatMessageWithToolInfo 带工具信息的聊天消息（内部使用）
+type ChatMessageWithToolInfo struct {
+	Role        string
+	Content     string
+	Images      []ImageBlock
+	ToolUses    []KiroToolUse    // assistant 消息中的工具调用
+	ToolResults []KiroToolResult // user 消息中的工具结果
+}
+
 // ChatStreamWithTools 流式聊天（支持工具调用）
 func (s *ChatService) ChatStreamWithTools(
 	messages []ChatMessage,
@@ -419,92 +450,9 @@ func (s *ChatService) ChatStreamWithTools(
 	}
 
 	conversationID := generateConversationID()
-	history := make([]any, 0)
 
-	// 转换历史消息
-	for i := 0; i < len(messages)-1; i++ {
-		msg := messages[i]
-		switch msg.Role {
-		case "user":
-			userMsg := map[string]any{
-				"content": msg.Content,
-				"origin":  "AI_EDITOR",
-			}
-			if len(msg.Images) > 0 {
-				images := make([]map[string]any, 0, len(msg.Images))
-				for _, img := range msg.Images {
-					images = append(images, map[string]any{
-						"format": img.Format,
-						"source": map[string]any{"bytes": img.Source.Bytes},
-					})
-				}
-				userMsg["images"] = images
-			}
-			history = append(history, map[string]any{"userInputMessage": userMsg})
-		case "assistant":
-			history = append(history, map[string]any{
-				"assistantResponseMessage": map[string]any{"content": msg.Content},
-			})
-		}
-	}
-
-	// 构建当前消息
-	var currentMessage map[string]any
-	if len(messages) > 0 {
-		lastMsg := messages[len(messages)-1]
-		userMsg := map[string]any{
-			"content": lastMsg.Content,
-			"origin":  "AI_EDITOR",
-		}
-		if len(lastMsg.Images) > 0 {
-			images := make([]map[string]any, 0, len(lastMsg.Images))
-			for _, img := range lastMsg.Images {
-				images = append(images, map[string]any{
-					"format": img.Format,
-					"source": map[string]any{"bytes": img.Source.Bytes},
-				})
-			}
-			userMsg["images"] = images
-		}
-
-		// 添加 userInputMessageContext（tools 和 toolResults）
-		if len(tools) > 0 || len(toolResults) > 0 {
-			ctx := map[string]any{}
-			if len(tools) > 0 {
-				// 转换 tools 为 map 格式
-				toolsData := make([]map[string]any, 0, len(tools))
-				for _, t := range tools {
-					toolsData = append(toolsData, map[string]any{
-						"toolSpecification": map[string]any{
-							"name":        t.ToolSpecification.Name,
-							"description": t.ToolSpecification.Description,
-							"inputSchema": map[string]any{"json": t.ToolSpecification.InputSchema},
-						},
-					})
-				}
-				ctx["tools"] = toolsData
-			}
-			if len(toolResults) > 0 {
-				// 转换 toolResults 为 map 格式
-				resultsData := make([]map[string]any, 0, len(toolResults))
-				for _, r := range toolResults {
-					contentData := make([]map[string]any, 0, len(r.Content))
-					for _, c := range r.Content {
-						contentData = append(contentData, map[string]any{"text": c.Text})
-					}
-					resultsData = append(resultsData, map[string]any{
-						"toolUseId": r.ToolUseId,
-						"content":   contentData,
-						"status":    r.Status,
-					})
-				}
-				ctx["toolResults"] = resultsData
-			}
-			userMsg["userInputMessageContext"] = ctx
-		}
-
-		currentMessage = map[string]any{"userInputMessage": userMsg}
-	}
+	// 构建 Kiro API 格式的历史消息和当前消息
+	history, currentMessage := s.buildKiroMessages(messages, tools, toolResults)
 
 	reqBody := map[string]any{
 		"conversationState": map[string]any{
@@ -523,6 +471,9 @@ func (s *ChatService) ChatStreamWithTools(
 	if err != nil {
 		return err
 	}
+
+	// 调试：打印请求体
+	fmt.Printf("[DEBUG] Kiro API 请求体:\n%s\n", string(body))
 
 	region := s.authManager.GetRegion()
 	var endpoint string
@@ -697,4 +648,242 @@ func parseToolInput(buffer string) map[string]interface{} {
 		}
 	}
 	return input
+}
+
+// buildKiroMessages 构建 Kiro API 格式的消息
+// 参考 kiroApi.ts 的 sanitizeConversation 实现
+// 返回：history（历史消息数组）, currentMessage（当前消息）
+func (s *ChatService) buildKiroMessages(
+	messages []ChatMessage,
+	tools []KiroToolWrapper,
+	toolResults []KiroToolResult,
+) ([]map[string]any, map[string]any) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	// 步骤1：确保消息以 user 开始
+	msgs := s.ensureStartsWithUser(messages)
+
+	// 步骤2：确保消息以 user 结束
+	msgs = s.ensureEndsWithUser(msgs)
+
+	// 步骤3：确保消息交替（合并连续的同角色消息）
+	msgs = s.ensureAlternating(msgs)
+
+	// 步骤4：构建 Kiro 格式的消息
+	history := make([]map[string]any, 0)
+
+	// 历史消息（除了最后一条）
+	for i := 0; i < len(msgs)-1; i++ {
+		msg := msgs[i]
+		kiroMsg := s.convertToKiroHistoryMessage(msg, tools, nil)
+		if kiroMsg != nil {
+			history = append(history, kiroMsg)
+		}
+	}
+
+	// 当前消息（最后一条，必须是 user）
+	var currentMessage map[string]any
+	if len(msgs) > 0 {
+		lastMsg := msgs[len(msgs)-1]
+		currentMessage = s.buildCurrentMessage(lastMsg, tools, toolResults)
+	}
+
+	return history, currentMessage
+}
+
+// ensureStartsWithUser 确保消息以 user 开始
+func (s *ChatService) ensureStartsWithUser(messages []ChatMessage) []ChatMessage {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// 如果第一条不是 user，在前面插入一个空的 user 消息
+	if messages[0].Role != "user" {
+		placeholder := ChatMessage{
+			Role:    "user",
+			Content: "Continue the conversation.",
+		}
+		return append([]ChatMessage{placeholder}, messages...)
+	}
+
+	return messages
+}
+
+// ensureEndsWithUser 确保消息以 user 结束
+func (s *ChatService) ensureEndsWithUser(messages []ChatMessage) []ChatMessage {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// 如果最后一条不是 user，在后面追加一个空的 user 消息
+	if messages[len(messages)-1].Role != "user" {
+		placeholder := ChatMessage{
+			Role:    "user",
+			Content: "Continue.",
+		}
+		return append(messages, placeholder)
+	}
+
+	return messages
+}
+
+// ensureAlternating 确保消息交替（合并连续的同角色消息）
+func (s *ChatService) ensureAlternating(messages []ChatMessage) []ChatMessage {
+	if len(messages) <= 1 {
+		return messages
+	}
+
+	result := make([]ChatMessage, 0, len(messages))
+	result = append(result, messages[0])
+
+	for i := 1; i < len(messages); i++ {
+		curr := messages[i]
+		prev := &result[len(result)-1]
+
+		// 如果当前消息和前一条角色相同，合并内容
+		if curr.Role == prev.Role {
+			if prev.Content != "" && curr.Content != "" {
+				prev.Content = prev.Content + "\n\n" + curr.Content
+			} else if curr.Content != "" {
+				prev.Content = curr.Content
+			}
+			// 合并图片
+			prev.Images = append(prev.Images, curr.Images...)
+		} else {
+			result = append(result, curr)
+		}
+	}
+
+	return result
+}
+
+// convertToKiroHistoryMessage 转换单条消息为 Kiro 历史消息格式
+func (s *ChatService) convertToKiroHistoryMessage(
+	msg ChatMessage,
+	tools []KiroToolWrapper,
+	toolResults []KiroToolResult,
+) map[string]any {
+	switch msg.Role {
+	case "user":
+		userMsg := map[string]any{
+			"content": msg.Content,
+			"origin":  "AI_EDITOR",
+		}
+
+		// 添加图片
+		if len(msg.Images) > 0 {
+			images := make([]map[string]any, 0, len(msg.Images))
+			for _, img := range msg.Images {
+				images = append(images, map[string]any{
+					"format": img.Format,
+					"source": map[string]any{"bytes": img.Source.Bytes},
+				})
+			}
+			userMsg["images"] = images
+		}
+
+		// 添加 tools（每条 user 消息都需要带上 tools）
+		if len(tools) > 0 {
+			ctx := s.buildUserInputMessageContext(tools, nil)
+			userMsg["userInputMessageContext"] = ctx
+		}
+
+		return map[string]any{"userInputMessage": userMsg}
+
+	case "assistant":
+		assistantMsg := map[string]any{
+			"content": msg.Content,
+		}
+		// 关键：如果有 toolUses，必须放到 assistantResponseMessage 中
+		if len(msg.ToolUses) > 0 {
+			toolUsesData := make([]map[string]any, 0, len(msg.ToolUses))
+			for _, tu := range msg.ToolUses {
+				toolUsesData = append(toolUsesData, map[string]any{
+					"toolUseId": tu.ToolUseId,
+					"name":      tu.Name,
+					"input":     tu.Input,
+				})
+			}
+			assistantMsg["toolUses"] = toolUsesData
+		}
+		return map[string]any{"assistantResponseMessage": assistantMsg}
+	}
+
+	return nil
+}
+
+// buildCurrentMessage 构建当前消息（最后一条 user 消息）
+func (s *ChatService) buildCurrentMessage(
+	msg ChatMessage,
+	tools []KiroToolWrapper,
+	toolResults []KiroToolResult,
+) map[string]any {
+	userMsg := map[string]any{
+		"content": msg.Content,
+		"origin":  "AI_EDITOR",
+	}
+
+	// 添加图片
+	if len(msg.Images) > 0 {
+		images := make([]map[string]any, 0, len(msg.Images))
+		for _, img := range msg.Images {
+			images = append(images, map[string]any{
+				"format": img.Format,
+				"source": map[string]any{"bytes": img.Source.Bytes},
+			})
+		}
+		userMsg["images"] = images
+	}
+
+	// 添加 userInputMessageContext（tools 和 toolResults）
+	if len(tools) > 0 || len(toolResults) > 0 {
+		ctx := s.buildUserInputMessageContext(tools, toolResults)
+		userMsg["userInputMessageContext"] = ctx
+	}
+
+	return map[string]any{"userInputMessage": userMsg}
+}
+
+// buildUserInputMessageContext 构建用户输入消息上下文
+func (s *ChatService) buildUserInputMessageContext(
+	tools []KiroToolWrapper,
+	toolResults []KiroToolResult,
+) map[string]any {
+	ctx := map[string]any{}
+
+	// 添加 tools
+	if len(tools) > 0 {
+		toolsData := make([]map[string]any, 0, len(tools))
+		for _, t := range tools {
+			toolsData = append(toolsData, map[string]any{
+				"toolSpecification": map[string]any{
+					"name":        t.ToolSpecification.Name,
+					"description": t.ToolSpecification.Description,
+					"inputSchema": map[string]any{"json": t.ToolSpecification.InputSchema},
+				},
+			})
+		}
+		ctx["tools"] = toolsData
+	}
+
+	// 添加 toolResults
+	if len(toolResults) > 0 {
+		resultsData := make([]map[string]any, 0, len(toolResults))
+		for _, r := range toolResults {
+			contentData := make([]map[string]any, 0, len(r.Content))
+			for _, c := range r.Content {
+				contentData = append(contentData, map[string]any{"text": c.Text})
+			}
+			resultsData = append(resultsData, map[string]any{
+				"toolUseId": r.ToolUseId,
+				"content":   contentData,
+				"status":    r.Status,
+			})
+		}
+		ctx["toolResults"] = resultsData
+	}
+
+	return ctx
 }
