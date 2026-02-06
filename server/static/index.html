@@ -508,29 +508,63 @@
             loadRateLimitConfig(); // 自动加载限流配置
             loadIpBlacklist();    // 自动加载 IP 黑名单
             loadModelMapping();   // 自动加载模型映射配置
+            
+            // 恢复上次访问的Tab状态
+            restoreLastTab();
         });
 
         // Tab 切换
         function initTabs() {
             document.querySelectorAll('.tab-button').forEach(btn => {
                 btn.addEventListener('click', () => {
-                    document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
-                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                    btn.classList.add('active');
-                    document.getElementById(btn.dataset.tab).classList.add('active');
-                    // 切换到统计图表 Tab 时自动加载数据
-                    if (btn.dataset.tab === 'charts') {
-                        loadAccountStats();
-                    }
-                    // 熔断管理 Tab：进入时启动自动刷新，离开时停止
-                    if (btn.dataset.tab === 'circuit-breaker') {
-                        loadCircuitBreakerStatus();
-                        startCBAutoRefresh();
-                    } else {
-                        stopCBAutoRefresh();
-                    }
+                    switchToTab(btn.dataset.tab);
                 });
             });
+        }
+        
+        // 切换到指定Tab
+        function switchToTab(tabId) {
+            // 移除所有active状态
+            document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            // 激活目标Tab
+            const targetBtn = document.querySelector(`.tab-button[data-tab="${tabId}"]`);
+            const targetContent = document.getElementById(tabId);
+            
+            if (targetBtn && targetContent) {
+                targetBtn.classList.add('active');
+                targetContent.classList.add('active');
+                
+                // 保存Tab状态到localStorage
+                localStorage.setItem('activeTab', tabId);
+                
+                // 切换到统计图表 Tab 时自动加载数据
+                if (tabId === 'charts') {
+                    loadAccountStats();
+                }
+                
+                // 熔断管理 Tab：进入时启动自动刷新，离开时停止
+                if (tabId === 'circuit-breaker') {
+                    loadCircuitBreakerStatus();
+                    startCBAutoRefresh();
+                } else {
+                    stopCBAutoRefresh();
+                }
+            }
+        }
+        
+        // 恢复上次访问的Tab
+        function restoreLastTab() {
+            const lastTab = localStorage.getItem('activeTab');
+            if (lastTab) {
+                // 先移除默认的active状态
+                document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                // 切换到上次的Tab
+                switchToTab(lastTab);
+            }
         }
 
         // Toast 通知
