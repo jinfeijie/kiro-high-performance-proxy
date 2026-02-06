@@ -655,6 +655,31 @@ func generateConversationID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// IsNonCircuitBreakingError 判断错误是否不应触发熔断和降级
+// 以下错误属于客户端问题或超时，不应计入熔断器失败计数：
+// 1. context deadline exceeded - 客户端超时，不是服务端故障
+// 2. Improperly formed request - 请求格式错误，客户端问题
+// 3. Input is too long / CONTENT_LENGTH_EXCEEDS_THRESHOLD - 输入过长，客户端问题
+func IsNonCircuitBreakingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "context deadline exceeded") {
+		return true
+	}
+	if strings.Contains(msg, "Improperly formed request") {
+		return true
+	}
+	if strings.Contains(msg, "CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+		return true
+	}
+	if strings.Contains(msg, "Input is too long") {
+		return true
+	}
+	return false
+}
+
 // ChatStreamWithModel 流式聊天（支持指定模型）
 // 向后兼容版本，不返回 usage 信息
 func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, callback func(content string, done bool)) error {
@@ -796,17 +821,22 @@ func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		// 记录请求失败（网络错误）
-		s.authManager.RecordRequestResult(accountID, false)
+		// 客户端超时等非服务端故障不触发熔断
+		if !IsNonCircuitBreakingError(err) {
+			s.authManager.RecordRequestResult(accountID, false)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		// 记录请求失败（HTTP错误）
-		s.authManager.RecordRequestResult(accountID, false)
-		return nil, fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+		reqErr := fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+		// 客户端参数错误（400）不触发熔断
+		if !IsNonCircuitBreakingError(reqErr) {
+			s.authManager.RecordRequestResult(accountID, false)
+		}
+		return nil, reqErr
 	}
 
 	// 记录请求成功
@@ -1431,15 +1461,20 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		s.authManager.RecordRequestResult(accountID, false)
+		if !IsNonCircuitBreakingError(err) {
+			s.authManager.RecordRequestResult(accountID, false)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		s.authManager.RecordRequestResult(accountID, false)
-		return nil, fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+		reqErr := fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+		if !IsNonCircuitBreakingError(reqErr) {
+			s.authManager.RecordRequestResult(accountID, false)
+		}
+		return nil, reqErr
 	}
 
 	s.authManager.RecordRequestResult(accountID, true)

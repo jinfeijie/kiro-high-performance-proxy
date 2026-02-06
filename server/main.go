@@ -1986,9 +1986,11 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 	})
 
 	if err != nil {
-		// 记录账号请求失败
+		// 客户端错误（超时/格式错误/输入过长）不记为账号失败，不触发降级
 		accountID, email := client.Auth.GetLastSelectedAccountInfo()
-		recordAccountRequest(accountID, email, 500, err.Error())
+		if !kiroclient.IsNonCircuitBreakingError(err) {
+			recordAccountRequest(accountID, email, 500, err.Error())
+		}
 		// 记录流式响应错误
 		if logger != nil {
 			logger.Error(GetMsgID(c), "流式响应失败", map[string]any{
@@ -2038,9 +2040,11 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	})
 
 	if err != nil {
-		// 记录账号请求失败
+		// 客户端错误（超时/格式错误/输入过长）不记为账号失败，不触发降级
 		accountID, email := client.Auth.GetLastSelectedAccountInfo()
-		recordAccountRequest(accountID, email, 500, err.Error())
+		if !kiroclient.IsNonCircuitBreakingError(err) {
+			recordAccountRequest(accountID, email, 500, err.Error())
+		}
 		if logger != nil {
 			RecordError(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "非流式响应失败", map[string]any{
@@ -2381,7 +2385,9 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 	if err != nil {
 		accountID, email := client.Auth.GetLastSelectedAccountInfo()
-		recordAccountRequest(accountID, email, 500, err.Error())
+		if !kiroclient.IsNonCircuitBreakingError(err) {
+			recordAccountRequest(accountID, email, 500, err.Error())
+		}
 		// 记录流式响应（带工具）错误
 		if logger != nil {
 			logger.Error(GetMsgID(c), "流式响应(Tools)失败", map[string]any{
@@ -2435,7 +2441,9 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 
 	if err != nil {
 		accountID, email := client.Auth.GetLastSelectedAccountInfo()
-		recordAccountRequest(accountID, email, 500, err.Error())
+		if !kiroclient.IsNonCircuitBreakingError(err) {
+			recordAccountRequest(accountID, email, 500, err.Error())
+		}
 		if logger != nil {
 			RecordError(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "非流式响应(Tools)失败", map[string]any{
