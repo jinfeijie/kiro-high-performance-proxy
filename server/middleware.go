@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"time"
 
@@ -59,6 +60,7 @@ func TraceMiddleware(logger *StructuredLogger) gin.HandlerFunc {
 				c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 				// 保存到 context
 				c.Set(RequestBodyKey, string(bodyBytes))
+				c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), RequestBodyKey, string(bodyBytes)))
 			}
 		}
 

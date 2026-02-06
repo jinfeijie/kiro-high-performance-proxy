@@ -725,7 +725,7 @@ func handleUpdateIpBlacklist(c *gin.Context) {
 	ipBlacklist = validIPs
 	if err := saveIpBlacklist(); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
@@ -848,7 +848,7 @@ func handleUpdateRateLimit(c *gin.Context) {
 
 	if err := saveRateLimitConfig(); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
@@ -1020,7 +1020,7 @@ func handleUpdateApiKeys(c *gin.Context) {
 	apiKeys = validKeys
 	if err := saveApiKeys(); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
@@ -1234,7 +1234,7 @@ func main() {
 		})
 	}
 
-	r.Run(":" + port)
+	_ = r.Run(":" + port)
 }
 
 // handleTokenStatus 获取 Token 状态
@@ -1309,12 +1309,12 @@ func handleTokenConfig(c *gin.Context) {
 
 	// 如果提供了 AccessToken，设置环境变量
 	if req.AccessToken != "" {
-		os.Setenv("KIRO_ACCESS_TOKEN", req.AccessToken)
+		_ = os.Setenv("KIRO_ACCESS_TOKEN", req.AccessToken)
 	}
 
 	// 如果提供了 TokenPath，设置环境变量
 	if req.TokenPath != "" {
-		os.Setenv("KIRO_AUTH_TOKEN_PATH", req.TokenPath)
+		_ = os.Setenv("KIRO_AUTH_TOKEN_PATH", req.TokenPath)
 	}
 
 	// 重新初始化客户端（清除旧 token 缓存，但保留保活和账号缓存）
@@ -1359,35 +1359,35 @@ func handleChat(c *gin.Context) {
 		if !ok {
 			err := fmt.Errorf("streaming not supported")
 			if logger != nil {
-				RecordError(c, logger, err, "")
+				RecordErrorFromGin(c, logger, err, "")
 			}
 			c.JSON(500, gin.H{"error": "Streaming not supported"})
 			return
 		}
 
-		err := client.Chat.ChatStreamWithModel(req.Messages, req.Model, func(content string, done bool) {
+		err := client.Chat.ChatStreamWithModel(c.Request.Context(), req.Messages, req.Model, func(content string, done bool) {
 			if done {
-				c.Writer.WriteString("data: [DONE]\n\n")
+				_, _ = c.Writer.WriteString("data: [DONE]\n\n")
 				flusher.Flush()
 				return
 			}
 
 			data := map[string]string{"content": content}
 			jsonData, _ := json.Marshal(data)
-			c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(jsonData)))
+			_, _ = c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(jsonData)))
 			flusher.Flush()
 		})
 
 		if err != nil {
-			c.Writer.WriteString(fmt.Sprintf("data: {\"error\": \"%s\"}\n\n", err.Error()))
+			_, _ = c.Writer.WriteString(fmt.Sprintf("data: {\"error\": \"%s\"}\n\n", err.Error()))
 			flusher.Flush()
 		}
 	} else {
 		// 非流式响应
-		response, err := client.Chat.ChatWithModel(req.Messages, req.Model)
+		response, err := client.Chat.ChatWithModel(c.Request.Context(), req.Messages, req.Model)
 		if err != nil {
 			if logger != nil {
-				RecordError(c, logger, err, "")
+				RecordErrorFromGin(c, logger, err, "")
 			}
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
@@ -1412,7 +1412,7 @@ func handleSearch(c *gin.Context) {
 	results, err := client.Search.Search(req.Query, req.MaxResults)
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -1426,7 +1426,7 @@ func handleToolsList(c *gin.Context) {
 	tools, err := client.MCP.ToolsList()
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -1450,7 +1450,7 @@ func handleToolsCall(c *gin.Context) {
 	content, err := client.MCP.ToolsCall(req.Name, req.Arguments)
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -1993,7 +1993,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 	if !ok {
 		err := fmt.Errorf("streaming not supported")
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": "Streaming not supported"})
 		return
@@ -2023,7 +2023,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 			},
 		}
 		data, _ := json.Marshal(msgStart)
-		fmt.Fprintf(c.Writer, "event: message_start\ndata: %s\n\n", string(data))
+		_, _ = fmt.Fprintf(c.Writer, "event: message_start\ndata: %s\n\n", string(data))
 
 		// 发送 content_block_start 事件
 		blockStart := map[string]any{
@@ -2035,12 +2035,12 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 			},
 		}
 		data, _ = json.Marshal(blockStart)
-		fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+		_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
 		flusher.Flush()
 	}
 
 	// 使用 ChatStreamWithModelAndUsage 获取精确 usage
-	usage, err := client.Chat.ChatStreamWithModelAndUsage(messages, model, func(content string, done bool) {
+	usage, err := client.Chat.ChatStreamWithModelAndUsage(c.Request.Context(), messages, model, func(content string, done bool) {
 		if done {
 			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
 			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
@@ -2080,8 +2080,8 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 					},
 				}
 				data, _ := json.Marshal(finalChunk)
-				fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
-				fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
+				_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 			} else {
 				// Claude 流式结束：发送 content_block_stop
 				blockStop := map[string]any{
@@ -2089,7 +2089,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 					"index": 0,
 				}
 				data, _ := json.Marshal(blockStop)
-				fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+				_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
 
 				// 发送 message_delta 事件（使用估算值）
 				msgDelta := map[string]any{
@@ -2103,14 +2103,14 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 					},
 				}
 				data, _ = json.Marshal(msgDelta)
-				fmt.Fprintf(c.Writer, "event: message_delta\ndata: %s\n\n", string(data))
+				_, _ = fmt.Fprintf(c.Writer, "event: message_delta\ndata: %s\n\n", string(data))
 
 				// 发送 message_stop 事件
 				msgStop := map[string]any{
 					"type": "message_stop",
 				}
 				data, _ = json.Marshal(msgStop)
-				fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
+				_, _ = fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
 			}
 			flusher.Flush()
 			return
@@ -2139,7 +2139,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				},
 			}
 			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
 		} else {
 			// Claude SSE 格式：content_block_delta
 			chunk := map[string]any{
@@ -2151,7 +2151,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				},
 			}
 			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
 		}
 
 		flusher.Flush()
@@ -2172,17 +2172,18 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				"accountId": accountID,
 			})
 		}
-		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
+		_, _ = fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
 	} else {
 		// 记录账号请求成功
 		accountID, email := client.Auth.GetLastSelectedAccountInfo()
 		recordAccountRequest(accountID, email, 200, "")
 
-		// 使用精确 usage（如果可用），否则降级使用估算值
+		// 使用精确 usage（如果可用且有效），否则降级使用估算值
+		// 注意：usage 可能非 nil 但 InputTokens 为 0（Kiro API 未返回有效 usage）
 		inputTokens := estimatedInputTokens
 		outputTokens := estimatedOutputTokens
-		if usage != nil {
+		if usage != nil && usage.InputTokens > 0 {
 			inputTokens = usage.InputTokens
 			outputTokens = usage.OutputTokens
 		}
@@ -2205,7 +2206,7 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	var responseBuilder strings.Builder
 
 	// 使用 ChatStreamWithModelAndUsage 获取精确 usage
-	usage, err := client.Chat.ChatStreamWithModelAndUsage(messages, model, func(content string, done bool) {
+	usage, err := client.Chat.ChatStreamWithModelAndUsage(c.Request.Context(), messages, model, func(content string, done bool) {
 		if !done {
 			responseBuilder.WriteString(content)
 		}
@@ -2218,7 +2219,7 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 			recordAccountRequest(accountID, email, 500, err.Error())
 		}
 		if logger != nil {
-			RecordError(c, logger, err, accountID)
+			RecordErrorFromGin(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "非流式响应失败", map[string]any{
 				"format":    format,
 				"model":     model,
@@ -2236,13 +2237,15 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	accountID, email := client.Auth.GetLastSelectedAccountInfo()
 	recordAccountRequest(accountID, email, 200, "")
 
-	// 使用精确 usage（如果可用），否则降级使用估算值
+	// 使用精确 usage（如果可用且有效），否则降级使用估算值
+	// 注意：usage 可能非 nil 但 InputTokens 为 0（Kiro API 未返回有效 usage）
+	// 此时应降级使用本地估算值，而不是覆盖为 0
 	inputTokens := estimatedInputTokens
 	outputTokens := kiroclient.CountTokens(response)
 	cacheReadTokens := 0
 	cacheWriteTokens := 0
 	reasoningTokens := 0
-	if usage != nil {
+	if usage != nil && usage.InputTokens > 0 {
 		inputTokens = usage.InputTokens
 		outputTokens = usage.OutputTokens
 		cacheReadTokens = usage.CacheReadTokens
@@ -2332,7 +2335,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 	if !ok {
 		err := fmt.Errorf("streaming not supported")
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": "Streaming not supported"})
 		return
@@ -2343,6 +2346,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 	var outputBuilder strings.Builder
 	msgID := generateID("msg")
 	contentBlockIndex := 0
+	hasToolUse := false // 是否真的有工具调用，用于判断 stop_reason
 
 	// Claude 格式：发送 message_start 事件（使用估算值）
 	if format == "claude" {
@@ -2360,7 +2364,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			},
 		}
 		data, _ := json.Marshal(msgStart)
-		fmt.Fprintf(c.Writer, "event: message_start\ndata: %s\n\n", string(data))
+		_, _ = fmt.Fprintf(c.Writer, "event: message_start\ndata: %s\n\n", string(data))
 		flusher.Flush()
 	}
 
@@ -2387,7 +2391,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				},
 			}
 			data, _ := json.Marshal(blockStart)
-			fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
 			textBlockStarted = true
 			contentBlockIndex++
 		}
@@ -2407,7 +2411,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				},
 			}
 			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
 		} else {
 			// 普通文本或已转换的 <thinking>/<think> 标签
 			chunk := map[string]any{
@@ -2419,13 +2423,13 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				},
 			}
 			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
 		}
 		flusher.Flush()
 	})
 
 	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
-	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
+	usage, err := client.Chat.ChatStreamWithToolsAndUsage(c.Request.Context(), messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
 		if done {
 			// 刷新 thinking 处理器缓冲区
 			thinkingProcessor.Flush()
@@ -2440,13 +2444,14 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 					"index": contentBlockIndex - 1,
 				}
 				data, _ := json.Marshal(blockStop)
-				fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+				_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
 			}
 
 			// 发送 message_delta 事件
+			// 只有真正有工具调用时才返回 tool_use，而不是根据 contentBlockIndex 判断
+			// contentBlockIndex 在文本块开始时就会递增，不能用来判断是否有工具调用
 			stopReason := "end_turn"
-			if contentBlockIndex > 0 {
-				// 如果有工具调用，stop_reason 为 tool_use
+			if hasToolUse {
 				stopReason = "tool_use"
 			}
 			msgDelta := map[string]any{
@@ -2460,12 +2465,12 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				},
 			}
 			data, _ := json.Marshal(msgDelta)
-			fmt.Fprintf(c.Writer, "event: message_delta\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: message_delta\ndata: %s\n\n", string(data))
 
 			// 发送 message_stop 事件
 			msgStop := map[string]any{"type": "message_stop"}
 			data, _ = json.Marshal(msgStop)
-			fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", string(data))
 
 			flusher.Flush()
 			return
@@ -2495,6 +2500,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 		// 处理工具调用
 		if toolUse != nil {
+			hasToolUse = true // 标记确实有工具调用
 			// 刷新 thinking 处理器缓冲区
 			thinkingProcessor.Flush()
 
@@ -2505,7 +2511,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 					"index": contentBlockIndex - 1,
 				}
 				data, _ := json.Marshal(blockStop)
-				fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+				_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
 				textBlockStarted = false
 			}
 
@@ -2527,7 +2533,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				},
 			}
 			data, _ := json.Marshal(blockStart)
-			fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
 
 			// 发送 input_json_delta
 			inputJSON, _ := json.Marshal(toolUse.Input)
@@ -2540,7 +2546,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				},
 			}
 			data, _ = json.Marshal(inputDelta)
-			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
 
 			// 发送 content_block_stop
 			blockStop := map[string]any{
@@ -2548,7 +2554,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				"index": contentBlockIndex,
 			}
 			data, _ = json.Marshal(blockStop)
-			fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+			_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
 
 			contentBlockIndex++
 			flusher.Flush()
@@ -2570,7 +2576,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 				"accountId":  accountID,
 			})
 		}
-		fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
+		_, _ = fmt.Fprintf(c.Writer, "data: {\"error\": \"%s\"}\n\n", err.Error())
 		flusher.Flush()
 	} else {
 		accountID, email := client.Auth.GetLastSelectedAccountInfo()
@@ -2602,7 +2608,7 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	var toolUses []*kiroclient.KiroToolUse
 
 	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
-	usage, err := client.Chat.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
+	usage, err := client.Chat.ChatStreamWithToolsAndUsage(c.Request.Context(), messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
 		if content != "" {
 			responseText.WriteString(content)
 		}
@@ -2617,7 +2623,7 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 			recordAccountRequest(accountID, email, 500, err.Error())
 		}
 		if logger != nil {
-			RecordError(c, logger, err, accountID)
+			RecordErrorFromGin(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "非流式响应(Tools)失败", map[string]any{
 				"format":     format,
 				"model":      model,
@@ -2808,7 +2814,7 @@ func handleUpdateProxyConfig(c *gin.Context) {
 	proxyConfig = req.Config
 	if err := saveProxyConfig(); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
 		return
@@ -2868,7 +2874,7 @@ func handleUpdateModelMapping(c *gin.Context) {
 	// 保存到文件
 	if err := saveModelMapping(); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": fmt.Sprintf("保存映射配置失败: %s", err.Error())})
 		return
@@ -2886,7 +2892,7 @@ func handleStartLogin(c *gin.Context) {
 		Region   string `json:"region"`
 		StartUrl string `json:"startUrl"` // 企业 SSO URL，空表示 Builder ID
 	}
-	c.ShouldBindJSON(&req)
+	_ = c.ShouldBindJSON(&req)
 
 	if req.Region == "" {
 		req.Region = "us-east-1"
@@ -2896,7 +2902,7 @@ func handleStartLogin(c *gin.Context) {
 	session, err := client.Auth.StartLogin(req.Region, req.StartUrl)
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -2936,7 +2942,7 @@ func handleImportAccount(c *gin.Context) {
 	account, err := client.Auth.ImportAccount(req.TokenJSON, req.ClientRegJSON)
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -2975,7 +2981,7 @@ func handlePollLogin(c *gin.Context) {
 	account, err := client.Auth.CompleteLogin(session)
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -3028,7 +3034,7 @@ func handleListAccounts(c *gin.Context) {
 	config, err := client.Auth.LoadAccountsConfig()
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, "")
+			RecordErrorFromGin(c, logger, err, "")
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -3107,7 +3113,7 @@ func handleDeleteAccount(c *gin.Context) {
 
 	if err := client.Auth.DeleteAccount(accountID); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, accountID)
+			RecordErrorFromGin(c, logger, err, accountID)
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -3122,7 +3128,7 @@ func handleRefreshAccount(c *gin.Context) {
 
 	if err := client.Auth.RefreshAccountToken(accountID); err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, accountID)
+			RecordErrorFromGin(c, logger, err, accountID)
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -3193,7 +3199,7 @@ func handleAccountDetail(c *gin.Context) {
 	config, err := client.Auth.LoadAccountsConfig()
 	if err != nil {
 		if logger != nil {
-			RecordError(c, logger, err, accountID)
+			RecordErrorFromGin(c, logger, err, accountID)
 		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

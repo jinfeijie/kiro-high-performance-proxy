@@ -1,6 +1,7 @@
 package kiroclient
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -31,7 +32,7 @@ func TestChatStream_WithValidModel(t *testing.T) {
 	for _, model := range validModels {
 		t.Run(model, func(t *testing.T) {
 			var receivedContent strings.Builder
-			err := chatService.ChatStreamWithModel(messages, model, func(content string, done bool) {
+			err := chatService.ChatStreamWithModel(context.Background(), messages, model, func(content string, done bool) {
 				if !done {
 					receivedContent.WriteString(content)
 				}
@@ -62,7 +63,7 @@ func TestChatStream_WithInvalidModel(t *testing.T) {
 	// 测试无效模型 - 应该失败或使用默认模型
 	invalidModel := "invalid-model-12345"
 
-	err := chatService.ChatStreamWithModel(messages, invalidModel, func(content string, done bool) {})
+	err := chatService.ChatStreamWithModel(context.Background(), messages, invalidModel, func(content string, done bool) {})
 
 	// 无效模型应该返回错误或使用默认模型
 	if err != nil {
@@ -86,7 +87,7 @@ func TestChatStream_WithoutModel(t *testing.T) {
 	}
 
 	// 使用空字符串表示不指定模型
-	err := chatService.ChatStreamWithModel(messages, "", func(content string, done bool) {})
+	err := chatService.ChatStreamWithModel(context.Background(), messages, "", func(content string, done bool) {})
 
 	if err != nil {
 		t.Logf("不指定模型测试失败（可能是 Token 问题）: %v", err)
@@ -110,7 +111,7 @@ func TestOpus45_JapaneseNovel(t *testing.T) {
 	}
 
 	var result strings.Builder
-	err := chatService.ChatStreamWithModel(messages, "claude-opus-4.5", func(content string, done bool) {
+	err := chatService.ChatStreamWithModel(context.Background(), messages, "claude-opus-4.5", func(content string, done bool) {
 		if !done {
 			result.WriteString(content)
 		}

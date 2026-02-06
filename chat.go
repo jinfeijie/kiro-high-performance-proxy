@@ -2,6 +2,7 @@ package kiroclient
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"time"
 )
+
+const RequestBodyKey = "requestBody"
 
 // TruncationType 截断类型
 // 用于标识 JSON 字符串被截断的方式，便于后续修复处理
@@ -639,6 +642,8 @@ type ChatService struct {
 }
 
 // NewChatService 创建聊天服务
+// 参数：
+// - authManager: 认证管理器
 func NewChatService(authManager *AuthManager) *ChatService {
 	return &ChatService{
 		authManager: authManager,
@@ -651,7 +656,7 @@ func NewChatService(authManager *AuthManager) *ChatService {
 // generateConversationID 生成会话 ID
 func generateConversationID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
@@ -685,16 +690,40 @@ func IsNonCircuitBreakingError(err error) bool {
 	return false
 }
 
+// IsErrorLog 观测日志
+func IsErrorLog(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+	// 模型ID无效属于客户端传参错误，不应触发熔断
+	if strings.Contains(msg, "INVALID_MODEL_ID") {
+		return false
+	}
+	return true
+}
+
+// toJSONString 将任意对象转换为JSON字符串（用于日志输出）
+// 如果转换失败，返回错误信息字符串
+func toJSONString(v interface{}) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("<JSON序列化失败: %v>", err)
+	}
+	return string(data)
+}
+
 // ChatStreamWithModel 流式聊天（支持指定模型）
 // 向后兼容版本，不返回 usage 信息
-func (s *ChatService) ChatStreamWithModel(messages []ChatMessage, model string, callback func(content string, done bool)) error {
-	_, err := s.ChatStreamWithModelAndUsage(messages, model, callback)
+func (s *ChatService) ChatStreamWithModel(ctx context.Context, messages []ChatMessage, model string, callback func(content string, done bool)) error {
+	_, err := s.ChatStreamWithModelAndUsage(ctx, messages, model, callback)
 	return err
 }
 
 // ChatStreamWithModelAndUsage 流式聊天（支持指定模型，返回精确 usage）
 // 返回 KiroUsage 包含从 Kiro API EventStream 解析的精确 token 使用量
-func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model string, callback func(content string, done bool)) (*KiroUsage, error) {
+func (s *ChatService) ChatStreamWithModelAndUsage(ctx context.Context, messages []ChatMessage, model string, callback func(content string, done bool)) (*KiroUsage, error) {
 	// 使用带账号ID的方法，便于熔断器追踪
 	token, accountID, err := s.authManager.GetAccessTokenWithAccountID()
 	if err != nil {
@@ -809,7 +838,7 @@ func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model 
 
 	url := endpoint + "/generateAssistantResponse"
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -826,17 +855,47 @@ func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		// 详细错误日志：记录完整的请求链路数据
+		if IsErrorLog(err) {
+
+			w, _ := io.ReadAll(resp.Body)
+			resp.Body = io.NopCloser(bytes.NewBuffer(w))
+
+			logMap := map[string]string{
+				"originReq": ctx.Value(RequestBodyKey).(string),
+				"kiroReq":   string(body),
+				"kiroResp":  string(w),
+				"err":       err.Error(),
+			}
+
+			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		}
 		// 客户端超时等非服务端故障不触发熔断
 		if !IsNonCircuitBreakingError(err) {
 			s.authManager.RecordRequestResult(accountID, false)
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		reqErr := fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+
+		// 详细错误日志：记录完整的请求链路数据
+		if IsErrorLog(err) {
+
+			logMap := map[string]string{
+				"originReq": ctx.Value(RequestBodyKey).(string),
+				"kiroReq":   string(body),
+				"kiroResp":  string(bodyBytes),
+				"err":       err.Error(),
+			}
+
+			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		}
 		// 客户端参数错误（400）不触发熔断
 		if !IsNonCircuitBreakingError(reqErr) {
 			s.authManager.RecordRequestResult(accountID, false)
@@ -972,7 +1031,7 @@ func extractStringFieldFromPayload(payload []byte, fieldName string) ([]byte, bo
 				if i+4 < len(payload) {
 					hex := string(payload[i+1 : i+5])
 					var r rune
-					fmt.Sscanf(hex, "%x", &r)
+					_, _ = fmt.Sscanf(hex, "%x", &r)
 					result = append(result, []byte(string(r))...)
 					i += 4
 				}
@@ -1200,10 +1259,10 @@ func (s *ChatService) parseHeaders(data []byte) map[string]string {
 }
 
 // Chat 非流式聊天
-func (s *ChatService) Chat(messages []ChatMessage) (string, error) {
+func (s *ChatService) Chat(ctx context.Context, messages []ChatMessage) (string, error) {
 	var result strings.Builder
 
-	err := s.ChatStreamWithModel(messages, "", func(content string, done bool) {
+	err := s.ChatStreamWithModel(ctx, messages, "", func(content string, done bool) {
 		result.WriteString(content)
 	})
 
@@ -1215,15 +1274,15 @@ func (s *ChatService) Chat(messages []ChatMessage) (string, error) {
 }
 
 // ChatStream 流式聊天（向后兼容，不指定模型）
-func (s *ChatService) ChatStream(messages []ChatMessage, callback func(content string, done bool)) error {
-	return s.ChatStreamWithModel(messages, "", callback)
+func (s *ChatService) ChatStream(ctx context.Context, messages []ChatMessage, callback func(content string, done bool)) error {
+	return s.ChatStreamWithModel(ctx, messages, "", callback)
 }
 
 // ChatWithModel 非流式聊天（支持指定模型）
-func (s *ChatService) ChatWithModel(messages []ChatMessage, model string) (string, error) {
+func (s *ChatService) ChatWithModel(ctx context.Context, messages []ChatMessage, model string) (string, error) {
 	var result strings.Builder
 
-	err := s.ChatStreamWithModel(messages, model, func(content string, done bool) {
+	err := s.ChatStreamWithModel(ctx, messages, model, func(content string, done bool) {
 		result.WriteString(content)
 	})
 
@@ -1235,15 +1294,15 @@ func (s *ChatService) ChatWithModel(messages []ChatMessage, model string) (strin
 }
 
 // SimpleChat 简单聊天
-func (s *ChatService) SimpleChat(prompt string) (string, error) {
-	return s.Chat([]ChatMessage{
+func (s *ChatService) SimpleChat(ctx context.Context, prompt string) (string, error) {
+	return s.Chat(ctx, []ChatMessage{
 		{Role: "user", Content: prompt},
 	})
 }
 
 // SimpleChatStream 简单流式聊天
-func (s *ChatService) SimpleChatStream(prompt string, callback func(content string, done bool)) error {
-	return s.ChatStream([]ChatMessage{
+func (s *ChatService) SimpleChatStream(ctx context.Context, prompt string, callback func(content string, done bool)) error {
+	return s.ChatStream(ctx, []ChatMessage{
 		{Role: "user", Content: prompt},
 	}, callback)
 }
@@ -1389,19 +1448,21 @@ type ChatMessageWithToolInfo struct {
 // ChatStreamWithTools 流式聊天（支持工具调用）
 // 向后兼容版本，不返回 usage 信息
 func (s *ChatService) ChatStreamWithTools(
+	ctx context.Context,
 	messages []ChatMessage,
 	model string,
 	tools []KiroToolWrapper,
 	toolResults []KiroToolResult,
 	callback ToolUseCallback,
 ) error {
-	_, err := s.ChatStreamWithToolsAndUsage(messages, model, tools, toolResults, callback)
+	_, err := s.ChatStreamWithToolsAndUsage(ctx, messages, model, tools, toolResults, callback)
 	return err
 }
 
 // ChatStreamWithToolsAndUsage 流式聊天（支持工具调用，返回精确 usage）
 // 返回 KiroUsage 包含从 Kiro API EventStream 解析的精确 token 使用量
 func (s *ChatService) ChatStreamWithToolsAndUsage(
+	ctx context.Context,
 	messages []ChatMessage,
 	model string,
 	tools []KiroToolWrapper,
@@ -1450,7 +1511,7 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 
 	url := endpoint + "/generateAssistantResponse"
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -1466,16 +1527,47 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+
+		if IsErrorLog(err) {
+
+			w, _ := io.ReadAll(resp.Body)
+			resp.Body = io.NopCloser(bytes.NewBuffer(w))
+
+			logMap := map[string]string{
+				"originReq": ctx.Value(RequestBodyKey).(string),
+				"kiroReq":   string(body),
+				"kiroResp":  string(w),
+				"err":       err.Error(),
+			}
+
+			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		}
+
 		if !IsNonCircuitBreakingError(err) {
 			s.authManager.RecordRequestResult(accountID, false)
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		reqErr := fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
+
+		// 详细错误日志：记录完整的请求链路数据
+		if IsErrorLog(err) {
+			logMap := map[string]string{
+				"originReq": ctx.Value(RequestBodyKey).(string),
+				"kiroReq":   string(body),
+				"kiroResp":  string(bodyBytes),
+				"err":       err.Error(),
+			}
+
+			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		}
+
 		if !IsNonCircuitBreakingError(reqErr) {
 			s.authManager.RecordRequestResult(accountID, false)
 		}

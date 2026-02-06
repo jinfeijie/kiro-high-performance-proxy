@@ -88,11 +88,7 @@ func TestSanitizeHeaders(t *testing.T) {
 	req.Header.Set("X-API-Key", "secret-key")
 	req.Header.Set("Accept", "*/*")
 
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = req
-
-	result := sanitizeHeaders(c)
+	result := sanitizeHeaders(req.Header)
 
 	if result["Authorization"] != "[REDACTED]" {
 		t.Errorf("Authorization 应该被脱敏")
@@ -131,7 +127,7 @@ func TestRecordError_Basic(t *testing.T) {
 
 	// 记录错误（输出到 stdout，不报错即可）
 	testErr := errors.New("test error message")
-	RecordError(c, logger, testErr, "account-456")
+	RecordErrorFromGin(c, logger, testErr, "account-456")
 }
 
 // TestRecordError_LargeBody 测试大请求体截断
@@ -159,7 +155,7 @@ func TestRecordError_LargeBody(t *testing.T) {
 
 	// 记录错误（输出到 stdout，不报错即可）
 	testErr := errors.New("large body error")
-	RecordError(c, logger, testErr, "")
+	RecordErrorFromGin(c, logger, testErr, "")
 }
 
 // TestRecordError_NilError 测试 nil 错误
@@ -179,7 +175,7 @@ func TestRecordError_NilError(t *testing.T) {
 	c.Set(MsgIDKey, "test-nil-error")
 
 	// nil 错误不应该 panic
-	RecordError(c, logger, nil, "")
+	RecordErrorFromGin(c, logger, nil, "")
 }
 
 // TestRecordError_NoMsgID 测试没有 msgId 的情况
@@ -200,7 +196,7 @@ func TestRecordError_NoMsgID(t *testing.T) {
 
 	// 没有 msgId 不应该 panic
 	testErr := errors.New("no msgid error")
-	RecordError(c, logger, testErr, "")
+	RecordErrorFromGin(c, logger, testErr, "")
 }
 
 // TestMaxBodySize 测试最大请求体大小常量
@@ -261,7 +257,7 @@ func TestRecordError_Integration(t *testing.T) {
 
 	// 记录错误
 	testErr := errors.New("database connection failed")
-	RecordError(c, logger, testErr, "acc-integration-test")
+	RecordErrorFromGin(c, logger, testErr, "acc-integration-test")
 
 	// 模拟请求结束日志
 	logger.Error("integration-test-123", "请求结束", map[string]any{

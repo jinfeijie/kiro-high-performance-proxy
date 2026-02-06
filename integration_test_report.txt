@@ -1,0 +1,77 @@
+=== RUN   TestOpenAIChat_NonStream_RequestFields
+=== RUN   TestOpenAIChat_NonStream_RequestFields/完整请求字段
+=== RUN   TestOpenAIChat_NonStream_RequestFields/缺少_model_字段
+=== RUN   TestOpenAIChat_NonStream_RequestFields/缺少_messages_字段
+=== RUN   TestOpenAIChat_NonStream_RequestFields/无效的_model
+--- PASS: TestOpenAIChat_NonStream_RequestFields (7.96s)
+    --- PASS: TestOpenAIChat_NonStream_RequestFields/完整请求字段 (3.87s)
+    --- PASS: TestOpenAIChat_NonStream_RequestFields/缺少_model_字段 (3.81s)
+    --- PASS: TestOpenAIChat_NonStream_RequestFields/缺少_messages_字段 (0.28s)
+    --- PASS: TestOpenAIChat_NonStream_RequestFields/无效的_model (0.00s)
+=== RUN   TestOpenAIChat_NonStream_ResponseFields
+    integration_test.go:202: ✅ OpenAI 非流式响应字段验证通过
+    integration_test.go:203:    ID: chatcmpl_1770398131653831000_9ec33992ad07c349
+    integration_test.go:204:    Model: claude-sonnet-4.5
+    integration_test.go:205:    Content: Hello! How can I help you today?
+    integration_test.go:207:    Usage: 0 input + 0 output = 0 total
+--- PASS: TestOpenAIChat_NonStream_ResponseFields (2.04s)
+=== RUN   TestOpenAIChat_Stream_ResponseFields
+    integration_test.go:345: ✅ OpenAI 流式响应字段验证通过
+    integration_test.go:346:    收到 3 个 chunks
+    integration_test.go:347:    Usage: map[completion_tokens:5 completion_tokens_details:map[audio_tokens:0 reasoning_tokens:0 text_tokens:5] prompt_tokens:12 prompt_tokens_details:map[audio_tokens:0 cached_tokens:0 image_tokens:0 text_tokens:12] total_tokens:17]
+--- PASS: TestOpenAIChat_Stream_ResponseFields (3.55s)
+=== RUN   TestClaudeChat_NonStream_RequestFields
+=== RUN   TestClaudeChat_NonStream_RequestFields/完整请求字段
+=== RUN   TestClaudeChat_NonStream_RequestFields/包含_system_字段（字符串）
+=== RUN   TestClaudeChat_NonStream_RequestFields/包含_temperature_字段
+=== RUN   TestClaudeChat_NonStream_RequestFields/缺少_model_字段
+=== RUN   TestClaudeChat_NonStream_RequestFields/缺少_messages_字段
+=== RUN   TestClaudeChat_NonStream_RequestFields/无效的_model
+--- PASS: TestClaudeChat_NonStream_RequestFields (15.38s)
+    --- PASS: TestClaudeChat_NonStream_RequestFields/完整请求字段 (4.64s)
+    --- PASS: TestClaudeChat_NonStream_RequestFields/包含_system_字段（字符串） (2.59s)
+    --- PASS: TestClaudeChat_NonStream_RequestFields/包含_temperature_字段 (3.28s)
+    --- PASS: TestClaudeChat_NonStream_RequestFields/缺少_model_字段 (4.59s)
+    --- PASS: TestClaudeChat_NonStream_RequestFields/缺少_messages_字段 (0.28s)
+    --- PASS: TestClaudeChat_NonStream_RequestFields/无效的_model (0.00s)
+=== RUN   TestClaudeChat_NonStream_ResponseFields
+    integration_test.go:547: ✅ Claude 非流式响应字段验证通过
+    integration_test.go:548:    ID: msg_1770398152471490000_6eea4785365d9f18
+    integration_test.go:549:    Model: claude-sonnet-4.5
+    integration_test.go:550:    Content: Hello! How can I help you today?
+    integration_test.go:551:    Usage: 10 input + 9 output
+--- PASS: TestClaudeChat_NonStream_ResponseFields (1.89s)
+=== RUN   TestClaudeChat_Stream_ResponseFields
+    integration_test.go:741: ✅ Claude 流式响应字段验证通过
+    integration_test.go:742:    收到 6 个 events
+    integration_test.go:743:    事件序列: [message_start content_block_start content_block_delta content_block_stop message_delta message_stop]
+--- PASS: TestClaudeChat_Stream_ResponseFields (7.88s)
+=== RUN   TestOpenAIChat_MultimodalContent
+    integration_test.go:803: ✅ OpenAI 多模态内容测试通过
+    integration_test.go:804:    响应: This image appears to be completely blank or white. There is no visible content, text, objects, or other elements that I can detect or describe. It's possible the image failed to load properly, or it may be an intentionally blank/white image.
+--- PASS: TestOpenAIChat_MultimodalContent (3.39s)
+=== RUN   TestClaudeChat_MultimodalContent
+    integration_test.go:865: ✅ Claude 多模态内容测试通过
+    integration_test.go:866:    响应: This image appears to be completely blank or white. There is no visible content, text, objects, or other elements that I can detect or describe. It's possible the image failed to load properly, or it may be an intentionally blank/white image.
+--- PASS: TestClaudeChat_MultimodalContent (3.09s)
+=== RUN   TestOpenAIChat_ErrorHandling
+=== RUN   TestOpenAIChat_ErrorHandling/无效的_JSON
+=== RUN   TestOpenAIChat_ErrorHandling/空请求体
+=== RUN   TestOpenAIChat_ErrorHandling/messages_不是数组
+--- PASS: TestOpenAIChat_ErrorHandling (0.00s)
+    --- PASS: TestOpenAIChat_ErrorHandling/无效的_JSON (0.00s)
+    --- PASS: TestOpenAIChat_ErrorHandling/空请求体 (0.00s)
+    --- PASS: TestOpenAIChat_ErrorHandling/messages_不是数组 (0.00s)
+=== RUN   TestClaudeChat_ErrorHandling
+=== RUN   TestClaudeChat_ErrorHandling/无效的_JSON
+=== RUN   TestClaudeChat_ErrorHandling/空请求体
+=== RUN   TestClaudeChat_ErrorHandling/messages_不是数组
+--- PASS: TestClaudeChat_ErrorHandling (0.00s)
+    --- PASS: TestClaudeChat_ErrorHandling/无效的_JSON (0.00s)
+    --- PASS: TestClaudeChat_ErrorHandling/空请求体 (0.00s)
+    --- PASS: TestClaudeChat_ErrorHandling/messages_不是数组 (0.00s)
+=== RUN   TestConcurrentRequests
+    integration_test.go:1016: ✅ 并发测试通过：10 个并发请求
+--- PASS: TestConcurrentRequests (19.88s)
+PASS
+ok  	command-line-arguments	65.433s

@@ -456,7 +456,7 @@
             <div class="bg-white rounded-lg shadow-md p-6 mb-6">
                 <div class="flex items-center justify-between mb-6">
                     <h2 class="text-xl font-bold text-gray-800">
-                        <i class="fas fa-chart-pie text-purple-600 mr-2"></i>账号调用统计
+                        <i class="fas fa-chart-pie text-purple-600 mr-2"></i>账号调用统计<span id="totalRequestsCount" class="text-gray-500 font-normal ml-2"></span>
                     </h2>
                     <button onclick="loadAccountStats()" class="bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition">
                         <i class="fas fa-sync-alt mr-2"></i>刷新数据
@@ -1367,8 +1367,11 @@
             try {
                 const resp = await fetch('/api/stats/accounts');
                 const data = await resp.json();
-                renderRequestPieChart(data.accounts || [], data.totalRequests || 0);
-                renderRequestRankList(data.accounts || [], data.totalRequests || 0);
+                // 更新标题中的总调用次数
+                const totalCount = data.totalRequests || 0;
+                document.getElementById('totalRequestsCount').textContent = `（${totalCount}）`;
+                renderRequestPieChart(data.accounts || [], totalCount);
+                renderRequestRankList(data.accounts || [], totalCount);
                 renderAccountErrorList(data.accounts || []);
                 showToast('统计数据已刷新', 'success');
             } catch (e) {

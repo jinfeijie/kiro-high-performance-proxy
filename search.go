@@ -12,6 +12,8 @@ type SearchService struct {
 }
 
 // NewSearchService 创建搜索服务
+// 参数：
+// - mcpClient: MCP 客户端
 func NewSearchService(mcpClient *MCPClient) *SearchService {
 	return &SearchService{
 		mcpClient: mcpClient,
