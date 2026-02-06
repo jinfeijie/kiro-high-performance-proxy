@@ -164,3 +164,164 @@ func TestModelValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamingContentTypeHeader 测试流式响应的 Content-Type 头
+// **Property 1: Streaming Response Content-Type Header Correctness**
+// **Validates: Requirements 1.1, 1.2, 1.3, 2.1**
+func TestStreamingContentTypeHeader(t *testing.T) {
+	client = kiroclient.NewKiroClient()
+
+	expectedContentType := "text/event-stream; charset=utf-8"
+
+	t.Run("handleChat streaming Content-Type", func(t *testing.T) {
+		router := gin.New()
+		router.POST("/chat", handleChat)
+
+		reqBody := struct {
+			Messages []kiroclient.ChatMessage `json:"messages"`
+			Stream   bool                     `json:"stream"`
+		}{
+			Messages: []kiroclient.ChatMessage{
+				{Role: "user", Content: "测试中文"},
+			},
+			Stream: true,
+		}
+
+		body, _ := json.Marshal(reqBody)
+		req, _ := http.NewRequest("POST", "/chat", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		contentType := w.Header().Get("Content-Type")
+		if contentType != expectedContentType {
+			t.Errorf("handleChat Content-Type = %q, want %q", contentType, expectedContentType)
+		}
+	})
+
+	t.Run("handleClaudeChat streaming Content-Type", func(t *testing.T) {
+		router := gin.New()
+		router.POST("/v1/messages", handleClaudeChat)
+
+		reqBody := ClaudeChatRequest{
+			Model: "claude-sonnet-4.5",
+			Messages: []map[string]any{
+				{"role": "user", "content": "测试中文"},
+			},
+			MaxTokens: 1000,
+			Stream:    true,
+		}
+
+		body, _ := json.Marshal(reqBody)
+		req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		contentType := w.Header().Get("Content-Type")
+		if contentType != expectedContentType {
+			t.Errorf("handleClaudeChat Content-Type = %q, want %q", contentType, expectedContentType)
+		}
+	})
+
+	t.Run("handleOpenAIChat streaming Content-Type", func(t *testing.T) {
+		router := gin.New()
+		router.POST("/v1/chat/completions", handleOpenAIChat)
+
+		reqBody := OpenAIChatRequest{
+			Model: "claude-sonnet-4.5",
+			Messages: []map[string]any{
+				{"role": "user", "content": "测试中文"},
+			},
+			Stream: true,
+		}
+
+		body, _ := json.Marshal(reqBody)
+		req, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		contentType := w.Header().Get("Content-Type")
+		if contentType != expectedContentType {
+			t.Errorf("handleOpenAIChat Content-Type = %q, want %q", contentType, expectedContentType)
+		}
+	})
+}
+
+// TestContentTypeConsistency 测试所有流式端点的 Content-Type 一致性
+// **Validates: Requirements 2.1**
+func TestContentTypeConsistency(t *testing.T) {
+	client = kiroclient.NewKiroClient()
+
+	expectedContentType := "text/event-stream; charset=utf-8"
+	contentTypes := make(map[string]string)
+
+	// 测试 handleChat
+	router1 := gin.New()
+	router1.POST("/chat", handleChat)
+	reqBody1 := struct {
+		Messages []kiroclient.ChatMessage `json:"messages"`
+		Stream   bool                     `json:"stream"`
+	}{
+		Messages: []kiroclient.ChatMessage{{Role: "user", Content: "test"}},
+		Stream:   true,
+	}
+	body1, _ := json.Marshal(reqBody1)
+	req1, _ := http.NewRequest("POST", "/chat", bytes.NewReader(body1))
+	req1.Header.Set("Content-Type", "application/json")
+	w1 := httptest.NewRecorder()
+	router1.ServeHTTP(w1, req1)
+	contentTypes["handleChat"] = w1.Header().Get("Content-Type")
+
+	// 测试 handleClaudeChat
+	router2 := gin.New()
+	router2.POST("/v1/messages", handleClaudeChat)
+	reqBody2 := ClaudeChatRequest{
+		Model:     "claude-sonnet-4.5",
+		Messages:  []map[string]any{{"role": "user", "content": "test"}},
+		MaxTokens: 1000,
+		Stream:    true,
+	}
+	body2, _ := json.Marshal(reqBody2)
+	req2, _ := http.NewRequest("POST", "/v1/messages", bytes.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	router2.ServeHTTP(w2, req2)
+	contentTypes["handleClaudeChat"] = w2.Header().Get("Content-Type")
+
+	// 测试 handleOpenAIChat
+	router3 := gin.New()
+	router3.POST("/v1/chat/completions", handleOpenAIChat)
+	reqBody3 := OpenAIChatRequest{
+		Model:    "claude-sonnet-4.5",
+		Messages: []map[string]any{{"role": "user", "content": "test"}},
+		Stream:   true,
+	}
+	body3, _ := json.Marshal(reqBody3)
+	req3, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body3))
+	req3.Header.Set("Content-Type", "application/json")
+	w3 := httptest.NewRecorder()
+	router3.ServeHTTP(w3, req3)
+	contentTypes["handleOpenAIChat"] = w3.Header().Get("Content-Type")
+
+	// 验证所有 Content-Type 一致
+	for handler, ct := range contentTypes {
+		if ct != expectedContentType {
+			t.Errorf("%s Content-Type = %q, want %q", handler, ct, expectedContentType)
+		}
+	}
+
+	// 验证三个处理器的 Content-Type 完全相同
+	first := ""
+	for handler, ct := range contentTypes {
+		if first == "" {
+			first = ct
+		} else if ct != first {
+			t.Errorf("Content-Type 不一致: %s 有 %q, 但其他有 %q", handler, ct, first)
+		}
+	}
+}

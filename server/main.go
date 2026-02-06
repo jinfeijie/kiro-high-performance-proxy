@@ -1179,7 +1179,7 @@ func handleChat(c *gin.Context) {
 
 	if req.Stream {
 		// 流式响应
-		c.Header("Content-Type", "text/event-stream")
+		c.Header("Content-Type", "text/event-stream; charset=utf-8")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 
@@ -1813,7 +1813,7 @@ func extractToolResultContent(content any) string {
 // handleStreamResponse 处理流式响应
 // 使用 ChatStreamWithModelAndUsage 获取 Kiro API 返回的精确 token 使用量
 func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, format string, model string) {
-	c.Header("Content-Type", "text/event-stream")
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
@@ -2148,7 +2148,7 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 // 使用 ChatStreamWithToolsAndUsage 获取 Kiro API 返回的精确 token 使用量
 // 参考 Kiro-account-manager proxyServer.ts 的 handleOpenAIStream/handleClaudeStream
 func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMessage, tools []kiroclient.KiroToolWrapper, toolResults []kiroclient.KiroToolResult, format string, model string, toolNameMap map[string]string) {
-	c.Header("Content-Type", "text/event-stream")
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
