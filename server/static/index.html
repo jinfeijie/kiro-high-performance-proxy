@@ -509,8 +509,11 @@
             loadIpBlacklist();    // 自动加载 IP 黑名单
             loadModelMapping();   // 自动加载模型映射配置
             
-            // 恢复上次访问的Tab状态
-            restoreLastTab();
+            // 从URL Hash恢复Tab状态
+            restoreTabFromHash();
+            
+            // 监听浏览器前进/后退按钮
+            window.addEventListener('hashchange', restoreTabFromHash);
         });
 
         // Tab 切换
@@ -536,8 +539,8 @@
                 targetBtn.classList.add('active');
                 targetContent.classList.add('active');
                 
-                // 保存Tab状态到localStorage
-                localStorage.setItem('activeTab', tabId);
+                // 更新URL Hash（不触发页面跳转）
+                history.replaceState(null, '', `#${tabId}`);
                 
                 // 切换到统计图表 Tab 时自动加载数据
                 if (tabId === 'charts') {
@@ -554,16 +557,34 @@
             }
         }
         
-        // 恢复上次访问的Tab
-        function restoreLastTab() {
-            const lastTab = localStorage.getItem('activeTab');
-            if (lastTab) {
-                // 先移除默认的active状态
-                document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                
-                // 切换到上次的Tab
-                switchToTab(lastTab);
+        // 从URL Hash恢复Tab状态
+        function restoreTabFromHash() {
+            // 获取URL Hash（去掉#号）
+            const hash = window.location.hash.substring(1);
+            
+            if (hash) {
+                // 验证Tab是否存在
+                const targetBtn = document.querySelector(`.tab-button[data-tab="${hash}"]`);
+                if (targetBtn) {
+                    // 先移除默认的active状态
+                    document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    
+                    // 切换到Hash指定的Tab（不更新URL，避免循环）
+                    targetBtn.classList.add('active');
+                    document.getElementById(hash).classList.add('active');
+                    
+                    // 触发特殊Tab的加载逻辑
+                    if (hash === 'charts') {
+                        loadAccountStats();
+                    }
+                    if (hash === 'circuit-breaker') {
+                        loadCircuitBreakerStatus();
+                        startCBAutoRefresh();
+                    } else {
+                        stopCBAutoRefresh();
+                    }
+                }
             }
         }
 
