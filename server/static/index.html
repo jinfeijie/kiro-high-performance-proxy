@@ -742,7 +742,13 @@
                 grid.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8"><i class="fas fa-user-plus text-4xl mb-2"></i><p>暂无账号，点击"新增账号"添加</p></div>';
                 return;
             }
-            grid.innerHTML = accounts.map(acc => {
+            // 按账号名称排序（0-9，A-Z）
+            const sorted = [...accounts].sort((a, b) => {
+                const nameA = formatUserId(a).toLowerCase();
+                const nameB = formatUserId(b).toLowerCase();
+                return nameA.localeCompare(nameB, 'en', { numeric: true });
+            });
+            grid.innerHTML = sorted.map(acc => {
                 const usedPct = acc.totalCredits > 0 ? Math.round((acc.usedCredits / acc.totalCredits) * 100) : 0;
                 const remaining = acc.totalCredits - acc.usedCredits;
                 const isExpired = acc.token && acc.token.isExpired;
@@ -1380,8 +1386,14 @@
                 container.innerHTML = '<div class="text-center text-gray-500 py-8">暂无数据</div>';
                 return;
             }
+            // 按成功率排序（成功率高的在上面）
+            const sorted = [...accounts].sort((a, b) => {
+                const rateA = a.requestCount > 0 ? (a.successCount / a.requestCount * 100) : 0;
+                const rateB = b.requestCount > 0 ? (b.successCount / b.requestCount * 100) : 0;
+                return rateB - rateA; // 降序排列，成功率高的在前
+            });
             let html = '';
-            accounts.forEach((acc, i) => {
+            sorted.forEach((acc, i) => {
                 // 优先显示邮箱，没有则显示 ID 前 8 位
                 const displayName = acc.email || acc.accountId.substring(0, 8);
                 const successRate = acc.requestCount > 0 ? (acc.successCount / acc.requestCount * 100).toFixed(1) : 0;
@@ -1442,7 +1454,13 @@
                     container.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8"><i class="fas fa-shield-alt text-4xl mb-2"></i><p>暂无账号数据</p></div>';
                     return;
                 }
-                container.innerHTML = accounts.map(acc => {
+                // 按账号名称排序（0-9，A-Z）
+                const sorted = [...accounts].sort((a, b) => {
+                    const nameA = (a.email || a.accountId).toLowerCase();
+                    const nameB = (b.email || b.accountId).toLowerCase();
+                    return nameA.localeCompare(nameB, 'en', { numeric: true });
+                });
+                container.innerHTML = sorted.map(acc => {
                     // 状态到 CSS 类的映射
                     const stateClass = acc.state === 'open' ? 'cb-status-open' : acc.state === 'half_open' ? 'cb-status-half-open' : 'cb-status-closed';
                     // 操作按钮：根据状态决定主要操作
