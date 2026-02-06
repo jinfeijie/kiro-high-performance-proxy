@@ -660,6 +660,7 @@ func generateConversationID() string {
 // 1. context deadline exceeded - 客户端超时，不是服务端故障
 // 2. Improperly formed request - 请求格式错误，客户端问题
 // 3. Input is too long / CONTENT_LENGTH_EXCEEDS_THRESHOLD - 输入过长，客户端问题
+// 4. INVALID_MODEL_ID - 模型ID无效，客户端传参问题
 func IsNonCircuitBreakingError(err error) bool {
 	if err == nil {
 		return false
@@ -675,6 +676,10 @@ func IsNonCircuitBreakingError(err error) bool {
 		return true
 	}
 	if strings.Contains(msg, "Input is too long") {
+		return true
+	}
+	// 模型ID无效属于客户端传参错误，不应触发熔断
+	if strings.Contains(msg, "INVALID_MODEL_ID") {
 		return true
 	}
 	return false

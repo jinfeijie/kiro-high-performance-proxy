@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/quick"
 
 	"github.com/gin-gonic/gin"
 
@@ -323,5 +325,238 @@ func TestContentTypeConsistency(t *testing.T) {
 		} else if ct != first {
 			t.Errorf("Content-Type 不一致: %s 有 %q, 但其他有 %q", handler, ct, first)
 		}
+	}
+}
+
+// ========== Task 4.3: 熔断管理 API 端点测试 ==========
+
+// setupCircuitBreakerTestRouter 创建测试用的 gin 路由器和初始化全局状态
+// 为什么单独封装：避免每个测试重复初始化全局变量，保持测试独立性
+func setupCircuitBreakerTestRouter(accountIDs ...string) *gin.Engine {
+	// 初始化全局 circuitStats
+	circuitStats = NewCircuitStats()
+
+	// 初始化全局 client，注入测试账号
+	client = kiroclient.NewKiroClient()
+	accounts := make([]kiroclient.AccountInfo, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		accounts = append(accounts, kiroclient.AccountInfo{
+			ID:    id,
+			Email: id + "@test.com",
+			Token: &kiroclient.KiroAuthToken{
+				AccessToken: "test-token-" + id,
+				ExpiresAt:   "2099-12-31T23:59:59Z",
+			},
+		})
+	}
+	client.Auth.SetAccountsCacheForTest(&kiroclient.AccountsConfig{
+		Accounts: accounts,
+	})
+
+	router := gin.New()
+	api := router.Group("/api")
+	api.GET("/circuit-breaker/status", handleCircuitBreakerStatus)
+	api.POST("/circuit-breaker/trip", handleCircuitBreakerTrip)
+	api.POST("/circuit-breaker/reset", handleCircuitBreakerReset)
+	return router
+}
+
+// ========== 单元测试：熔断管理 API ==========
+
+// TestCircuitBreakerTrip_NotFound 手动熔断不存在的账号应返回 404
+// **Validates: Requirements 3.1**
+func TestCircuitBreakerTrip_NotFound(t *testing.T) {
+	router := setupCircuitBreakerTestRouter("acc-1")
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"accountId": "non-existent-account",
+	})
+	req, _ := http.NewRequest("POST", "/api/circuit-breaker/trip", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 404 {
+		t.Errorf("期望状态码 404, 得到 %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if _, ok := resp["error"]; !ok {
+		t.Error("响应中应包含 error 字段")
+	}
+}
+
+// TestCircuitBreakerReset_NotFound 解除熔断不存在的账号应返回 404
+// **Validates: Requirements 4.1**
+func TestCircuitBreakerReset_NotFound(t *testing.T) {
+	router := setupCircuitBreakerTestRouter("acc-1")
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"accountId": "non-existent-account",
+	})
+	req, _ := http.NewRequest("POST", "/api/circuit-breaker/reset", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 404 {
+		t.Errorf("期望状态码 404, 得到 %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if _, ok := resp["error"]; !ok {
+		t.Error("响应中应包含 error 字段")
+	}
+}
+
+// TestCircuitBreakerStatus_EmptyAccounts 无账号时返回空数组
+// **Validates: Requirements 2.4**
+func TestCircuitBreakerStatus_EmptyAccounts(t *testing.T) {
+	// 不传任何账号 ID，模拟空账号场景
+	router := setupCircuitBreakerTestRouter()
+
+	req, _ := http.NewRequest("GET", "/api/circuit-breaker/status", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Errorf("期望状态码 200, 得到 %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+
+	accounts, ok := resp["accounts"].([]interface{})
+	if !ok {
+		t.Fatal("响应中 accounts 字段应为数组")
+	}
+	if len(accounts) != 0 {
+		t.Errorf("期望空数组, 得到 %d 个元素", len(accounts))
+	}
+
+	totalAccounts, ok := resp["totalAccounts"].(float64)
+	if !ok {
+		t.Fatal("响应中应包含 totalAccounts 字段")
+	}
+	if int(totalAccounts) != 0 {
+		t.Errorf("期望 totalAccounts=0, 得到 %d", int(totalAccounts))
+	}
+}
+
+// ========== Property 3: 熔断状态 API 响应完整性 ==========
+// Feature: circuit-breaker-dashboard, Property 3: 熔断状态 API 响应完整性
+// **Validates: Requirements 2.1, 2.2, 2.3**
+//
+// *For any* 账号集合，GET /api/circuit-breaker/status 返回的每个账号条目
+// 都包含 state、failureCount、errorRate1m、errorRate5m、weight、loadPercent 字段，
+// 且所有账号的 loadPercent 之和约等于 100%（误差 ±1%，排除所有账号权重为 0 的情况）。
+
+func TestProperty3_CircuitBreakerStatusResponseCompleteness(t *testing.T) {
+	// 必需字段列表（API 响应中每个账号条目必须包含的字段）
+	requiredFields := []string{
+		"state", "failureCount", "errorRate1m",
+		"errorRate5m", "weight", "loadPercent",
+	}
+
+	cfg := &quick.Config{MaxCount: 100}
+	err := quick.Check(func(n uint8) bool {
+		// 生成 1~10 个账号（避免 0 个账号的退化情况）
+		count := int(n%10) + 1
+		ids := make([]string, count)
+		for i := 0; i < count; i++ {
+			ids[i] = fmt.Sprintf("prop3-acc-%d", i)
+		}
+
+		router := setupCircuitBreakerTestRouter(ids...)
+
+		req, _ := http.NewRequest("GET", "/api/circuit-breaker/status", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != 200 {
+			t.Logf("状态码非 200: %d", w.Code)
+			return false
+		}
+
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Logf("JSON 解析失败: %v", err)
+			return false
+		}
+
+		accounts, ok := resp["accounts"].([]interface{})
+		if !ok {
+			t.Log("accounts 字段不是数组")
+			return false
+		}
+
+		if len(accounts) != count {
+			t.Logf("期望 %d 个账号, 得到 %d", count, len(accounts))
+			return false
+		}
+
+		// 验证每个账号条目包含所有必需字段
+		loadPercentSum := 0.0
+		allWeightZero := true
+
+		for i, raw := range accounts {
+			acc, ok := raw.(map[string]interface{})
+			if !ok {
+				t.Logf("账号 %d 不是 map", i)
+				return false
+			}
+
+			for _, field := range requiredFields {
+				if _, exists := acc[field]; !exists {
+					t.Logf("账号 %d 缺少字段: %s", i, field)
+					return false
+				}
+			}
+
+			// 累加 loadPercent
+			lp, ok := acc["loadPercent"].(float64)
+			if !ok {
+				t.Logf("账号 %d 的 loadPercent 不是数字", i)
+				return false
+			}
+			loadPercentSum += lp
+
+			// 检查权重是否全为 0
+			w, ok := acc["weight"].(float64)
+			if !ok {
+				t.Logf("账号 %d 的 weight 不是数字", i)
+				return false
+			}
+			if int(w) != 0 {
+				allWeightZero = false
+			}
+		}
+
+		// 如果所有账号权重都为 0，跳过 loadPercent 之和检查
+		if allWeightZero {
+			return true
+		}
+
+		// loadPercent 之和应约等于 100%（误差 ±1%）
+		if loadPercentSum < 99.0 || loadPercentSum > 101.0 {
+			t.Logf("loadPercent 之和 %.2f 不在 [99, 101] 范围内", loadPercentSum)
+			return false
+		}
+
+		return true
+	}, cfg)
+
+	if err != nil {
+		t.Errorf("Property 3 失败: %v", err)
 	}
 }

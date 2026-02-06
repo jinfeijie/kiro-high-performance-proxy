@@ -377,6 +377,8 @@ type CircuitBreakerConfig struct {
 	FailureWindow      time.Duration // 失败计数窗口（默认5分钟）
 	OpenDuration       time.Duration // 熔断持续时间（默认5分钟）
 	HalfOpenMaxSuccess int           // 半开状态下成功多少次后关闭熔断（默认2次）
+	ErrorRateThreshold float64       // 错误率阈值，超过此值自动熔断（默认0.8，即80%）
+	ErrorRateMinReqs   int64         // 错误率检查的最少请求数（默认5，防止样本太少误判）
 }
 
 // DefaultCircuitBreakerConfig 默认熔断器配置
@@ -384,7 +386,17 @@ var DefaultCircuitBreakerConfig = CircuitBreakerConfig{
 	FailureThreshold:   3,
 	FailureWindow:      5 * time.Minute,
 	OpenDuration:       5 * time.Minute,
-	HalfOpenMaxSuccess: 2,
+	HalfOpenMaxSuccess: 5,
+	ErrorRateThreshold: 0.8,
+	ErrorRateMinReqs:   5,
+}
+
+// AccountLoadInfo 账号负载信息（用于熔断管理面板展示）
+type AccountLoadInfo struct {
+	AccountID string  `json:"accountId"` // 账号唯一标识
+	Email     string  `json:"email"`     // 账号邮箱
+	Weight    int     `json:"weight"`    // 当前权重（0-100）
+	Percent   float64 `json:"percent"`   // 负载占比百分比
 }
 
 // AccountUsageCache 账号额度缓存

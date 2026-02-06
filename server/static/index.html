@@ -21,6 +21,10 @@
         .model-card { transition: all 0.15s ease; }
         .model-card:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .privacy-mode .sensitive { filter: blur(6px); }
+        /* 熔断状态标签 */
+        .cb-status-closed { background-color: #10B981; color: white; }
+        .cb-status-open { background-color: #EF4444; color: white; }
+        .cb-status-half-open { background-color: #F59E0B; color: white; }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -63,6 +67,9 @@
                 </button>
                 <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="settings">
                     <i class="fas fa-cog mr-2"></i>API 设置
+                </button>
+                <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="circuit-breaker">
+                    <i class="fas fa-shield-alt mr-2"></i>熔断管理
                 </button>
                 <button class="tab-button px-6 py-3 font-medium text-gray-700 hover:bg-gray-50 transition whitespace-nowrap" data-tab="charts">
                     <i class="fas fa-chart-pie mr-2"></i>统计图表
@@ -424,6 +431,26 @@
             </div>
         </div>
 
+        <!-- 熔断管理面板 -->
+        <div id="circuit-breaker" class="tab-content">
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-gray-800">
+                        <i class="fas fa-shield-alt text-blue-600 mr-2"></i>熔断管理
+                    </h2>
+                    <button onclick="loadCircuitBreakerStatus()" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition">
+                        <i class="fas fa-sync-alt mr-2"></i>刷新
+                    </button>
+                </div>
+                <div id="circuit-breaker-cards" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div class="col-span-3 text-center text-gray-500 py-8">
+                        <i class="fas fa-shield-alt text-4xl mb-2"></i>
+                        <p>切换到此 Tab 时自动加载熔断状态</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- 统计图表面板 -->
         <div id="charts" class="tab-content">
             <div class="bg-white rounded-lg shadow-md p-6 mb-6">
@@ -494,6 +521,13 @@
                     // 切换到统计图表 Tab 时自动加载数据
                     if (btn.dataset.tab === 'charts') {
                         loadAccountStats();
+                    }
+                    // 熔断管理 Tab：进入时启动自动刷新，离开时停止
+                    if (btn.dataset.tab === 'circuit-breaker') {
+                        loadCircuitBreakerStatus();
+                        startCBAutoRefresh();
+                    } else {
+                        stopCBAutoRefresh();
                     }
                 });
             });
@@ -639,10 +673,38 @@
         }
 
         function copyVerifyUrl() {
-            if (currentLoginSession && currentLoginSession.verifyUrl) {
-                navigator.clipboard.writeText(currentLoginSession.verifyUrl);
-                showToast('授权链接已复制', 'success');
+            if (!currentLoginSession || !currentLoginSession.verifyUrl) {
+                showToast('授权链接不可用', 'error');
+                return;
             }
+            const url = currentLoginSession.verifyUrl;
+            // navigator.clipboard 在 HTTP 下不可用，用 fallback
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(url).then(() => {
+                    showToast('授权链接已复制', 'success');
+                }).catch(() => {
+                    fallbackCopy(url, '授权链接已复制');
+                });
+            } else {
+                fallbackCopy(url, '授权链接已复制');
+            }
+        }
+
+        function fallbackCopy(text, successMsg) {
+            const msg = successMsg || '已复制到剪贴板';
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            try {
+                document.execCommand('copy');
+                showToast(msg, 'success');
+            } catch (e) {
+                prompt('请手动复制:', text);
+            }
+            document.body.removeChild(ta);
         }
 
         function closeLoginModal() {
@@ -1102,8 +1164,13 @@
 
         function copyApiKey(index) {
             const key = currentApiKeys[index];
-            navigator.clipboard.writeText(key);
-            showToast('API-KEY 已复制', 'success');
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(key).then(() => {
+                    showToast('API-KEY 已复制', 'success');
+                }).catch(() => { fallbackCopy(key, 'API-KEY 已复制'); });
+            } else {
+                fallbackCopy(key, 'API-KEY 已复制');
+            }
         }
 
         function generateApiKey() {
@@ -1358,6 +1425,108 @@
                 </div>`;
             });
             container.innerHTML = html;
+        }
+
+        // ========== 熔断管理 ==========
+        let cbAutoRefreshTimer = null;
+
+        // 加载熔断状态并渲染卡片
+        async function loadCircuitBreakerStatus() {
+            const container = document.getElementById('circuit-breaker-cards');
+            try {
+                const resp = await fetch('/api/circuit-breaker/status');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                const accounts = data.accounts || [];
+                if (accounts.length === 0) {
+                    container.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-8"><i class="fas fa-shield-alt text-4xl mb-2"></i><p>暂无账号数据</p></div>';
+                    return;
+                }
+                container.innerHTML = accounts.map(acc => {
+                    // 状态到 CSS 类的映射
+                    const stateClass = acc.state === 'open' ? 'cb-status-open' : acc.state === 'half_open' ? 'cb-status-half-open' : 'cb-status-closed';
+                    // 操作按钮：根据状态决定主要操作
+                    let actionButtons = '';
+                    if (acc.state === 'open') {
+                        actionButtons = `<button onclick="resetAccount('${acc.accountId}')" class="flex-1 px-3 py-1.5 bg-green-500 text-white text-sm rounded hover:bg-green-600 transition"><i class="fas fa-unlock mr-1"></i>解除熔断</button>
+                            <button onclick="tripAccount('${acc.accountId}')" class="px-3 py-1.5 border border-red-300 text-red-500 text-sm rounded hover:bg-red-50 transition"><i class="fas fa-ban mr-1"></i>熔断</button>`;
+                    } else {
+                        actionButtons = `<button onclick="tripAccount('${acc.accountId}')" class="flex-1 px-3 py-1.5 bg-red-500 text-white text-sm rounded hover:bg-red-600 transition"><i class="fas fa-ban mr-1"></i>熔断</button>
+                            <button onclick="resetAccount('${acc.accountId}')" class="px-3 py-1.5 border border-green-300 text-green-500 text-sm rounded hover:bg-green-50 transition"><i class="fas fa-unlock mr-1"></i>解除熔断</button>`;
+                    }
+                    return `<div class="bg-white border rounded-lg p-4 shadow-sm">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="font-medium text-gray-800">${acc.email || acc.accountId}</span>
+                            <span class="px-2 py-1 rounded text-sm font-medium ${stateClass}">${acc.stateLabel}</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2 text-sm text-gray-600 mb-3">
+                            <div>1分钟错误率: <span class="font-medium">${acc.errorRate1m.toFixed(1)}%</span></div>
+                            <div>5分钟错误率: <span class="font-medium">${acc.errorRate5m.toFixed(1)}%</span></div>
+                            <div>负载比例: <span class="font-medium">${acc.loadPercent.toFixed(1)}%</span></div>
+                            <div>权重: <span class="font-medium">${acc.weight}</span></div>
+                        </div>
+                        <div class="flex gap-2">
+                            ${actionButtons}
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                // 加载失败：显示错误提示，保留上次数据
+                showToast('加载熔断状态失败: ' + e.message, 'error');
+            }
+        }
+
+        // 手动熔断
+        async function tripAccount(accountId) {
+            try {
+                const resp = await fetch('/api/circuit-breaker/trip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accountId })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    showToast(data.error || '熔断操作失败', 'error');
+                    return;
+                }
+                showToast(data.message || '已熔断', 'success');
+                loadCircuitBreakerStatus();
+            } catch (e) {
+                showToast('熔断操作失败: ' + e.message, 'error');
+            }
+        }
+
+        // 解除熔断
+        async function resetAccount(accountId) {
+            try {
+                const resp = await fetch('/api/circuit-breaker/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accountId })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    showToast(data.error || '解除熔断失败', 'error');
+                    return;
+                }
+                showToast(data.message || '已解除熔断', 'success');
+                loadCircuitBreakerStatus();
+            } catch (e) {
+                showToast('解除熔断失败: ' + e.message, 'error');
+            }
+        }
+
+        // 10秒自动刷新定时器
+        function startCBAutoRefresh() {
+            stopCBAutoRefresh();
+            cbAutoRefreshTimer = setInterval(loadCircuitBreakerStatus, 10000);
+        }
+
+        function stopCBAutoRefresh() {
+            if (cbAutoRefreshTimer) {
+                clearInterval(cbAutoRefreshTimer);
+                cbAutoRefreshTimer = null;
+            }
         }
     </script>
 </body>

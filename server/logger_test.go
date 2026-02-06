@@ -63,9 +63,9 @@ func TestStructuredLogger_GetLevel(t *testing.T) {
 	}
 	defer logger.Close()
 
-	// 默认级别应该是 INFO
-	if got := logger.GetLevel(); got != INFO {
-		t.Errorf("GetLevel() = %v, want %v", got, INFO)
+	// 默认级别应该是 NONE（生产环境默认关闭所有日志，与 DefaultLogLevel 一致）
+	if got := logger.GetLevel(); got != NONE {
+		t.Errorf("GetLevel() = %v, want %v", got, NONE)
 	}
 
 	// 设置为 ERROR

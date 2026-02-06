@@ -243,12 +243,15 @@ func (m *AuthManager) recordFailure(accountID string) {
 	}
 
 	now := time.Now()
+	// 先保存上次失败时间用于窗口判断，再更新为当前时间
+	prevFailureTime := cb.LastFailureTime
 	cb.LastFailureTime = now
 
 	switch cb.State {
 	case CircuitClosed:
-		// 检查是否在失败窗口内
-		if time.Since(cb.LastFailureTime) > m.circuitConfig.FailureWindow {
+		// 检查上次失败是否在窗口内（用旧的 LastFailureTime 判断）
+		// 如果超出窗口，说明是新一轮失败，重置计数
+		if prevFailureTime.IsZero() || now.Sub(prevFailureTime) > m.circuitConfig.FailureWindow {
 			cb.FailureCount = 1
 		} else {
 			cb.FailureCount++
@@ -599,6 +602,15 @@ func (m *AuthManager) SaveToken(token *KiroAuthToken) error {
 	}
 
 	return nil
+}
+
+// ClearTokenCache 清除内存中的 token 和 clientReg 缓存
+// 用于 token 配置变更后强制重新加载，而不需要重建整个 client
+func (m *AuthManager) ClearTokenCache() {
+	m.mu.Lock()
+	m.token = nil
+	m.clientReg = nil
+	m.mu.Unlock()
 }
 
 // GetAccessToken 获取有效的 Access Token（加权轮询选择账号）
@@ -1596,6 +1608,16 @@ func (m *AuthManager) RefreshAccountToken(accountID string) error {
 		region = "us-east-1"
 	}
 
+	// 检查 ClientID 和 ClientSecret 是否存在（导入的账号可能缺失）
+	if targetAccount.ClientID == "" || targetAccount.ClientSecret == "" {
+		return fmt.Errorf("账号 %s 缺少 ClientID/ClientSecret，无法刷新", accountID)
+	}
+
+	// 检查 RefreshToken 是否存在
+	if targetAccount.Token.RefreshToken == "" {
+		return fmt.Errorf("账号 %s 缺少 RefreshToken，无法刷新", accountID)
+	}
+
 	url := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
 
 	reqBody := TokenRefreshRequest{
@@ -1713,7 +1735,7 @@ func (m *AuthManager) StopKeepAlive() {
 }
 
 // RefreshAllAccounts 刷新所有账号的 Token
-// 只刷新即将过期（30分钟内）的 Token，同时更新额度缓存
+// 只刷新即将过期（60分钟内）的 Token，同时更新额度缓存
 func (m *AuthManager) RefreshAllAccounts() {
 	config, err := m.LoadAccountsConfig()
 	if err != nil {
@@ -1730,8 +1752,8 @@ func (m *AuthManager) RefreshAllAccounts() {
 			continue
 		}
 
-		// 检查是否即将过期（30分钟内）
-		if !m.isTokenExpiringSoon(acc.Token, 30*time.Minute) {
+		// 检查是否即将过期（60分钟内）
+		if !m.isTokenExpiringSoon(acc.Token, 60*time.Minute) {
 			// Token 未过期，但仍然更新额度缓存（异步）
 			go func(accID, accessToken, region, profileArn string) {
 				usage, err := m.GetUsageLimitsWithToken(accessToken, region, profileArn)
@@ -1749,7 +1771,12 @@ func (m *AuthManager) RefreshAllAccounts() {
 		}
 
 		// 使用该账号自己的 ClientID/ClientSecret 刷新
-		_ = m.RefreshAccountToken(acc.ID)
+		// 失败时重试一次（网络抖动等临时问题）
+		if err := m.RefreshAccountToken(acc.ID); err != nil {
+			// 等待 3 秒后重试一次
+			time.Sleep(3 * time.Second)
+			_ = m.RefreshAccountToken(acc.ID)
+		}
 	}
 }
 
@@ -1890,4 +1917,160 @@ func (m *AuthManager) GetAccountsStatus() ([]map[string]interface{}, error) {
 	}
 
 	return result, nil
+}
+
+// ========== 熔断管理面板方法 ==========
+
+// IsAccountAvailable 检查账号是否可用（导出版，供 server 包调用）
+func (m *AuthManager) IsAccountAvailable(accountID string) bool {
+	return m.isAccountAvailable(accountID)
+}
+
+// IsAccountHalfOpen 检查账号是否处于半开状态（供 server 包判断是否跳过错误率检查）
+func (m *AuthManager) IsAccountHalfOpen(accountID string) bool {
+	m.circuitMu.RLock()
+	defer m.circuitMu.RUnlock()
+	cb, exists := m.circuitBreakers[accountID]
+	if !exists {
+		return false
+	}
+	return cb.State == CircuitHalfOpen
+}
+
+// GetCircuitConfig 获取熔断器配置（供 server 包读取阈值）
+func (m *AuthManager) GetCircuitConfig() CircuitBreakerConfig {
+	return m.circuitConfig
+}
+
+// ManualTrip 手动熔断指定账号
+// 将熔断器状态设为 Open，刷新 OpenedAt
+// 如果账号不存在于熔断器 map 中，先检查账号配置是否存在
+func (m *AuthManager) ManualTrip(accountID string) error {
+	// 先检查账号是否存在于配置中
+	if !m.accountExists(accountID) {
+		return fmt.Errorf("账号不存在: %s", accountID)
+	}
+
+	m.circuitMu.Lock()
+	defer m.circuitMu.Unlock()
+
+	cb, exists := m.circuitBreakers[accountID]
+	if !exists {
+		// 账号存在但没有熔断器记录，创建一个
+		cb = &CircuitBreaker{}
+		m.circuitBreakers[accountID] = cb
+	}
+
+	// 无论当前什么状态，都设为 Open 并刷新时间
+	cb.State = CircuitOpen
+	cb.OpenedAt = time.Now()
+	return nil
+}
+
+// ManualReset 手动解除熔断
+// 将熔断器状态设为 Closed，重置 FailureCount 和 SuccessCount 为 0
+func (m *AuthManager) ManualReset(accountID string) error {
+	// 先检查账号是否存在于配置中
+	if !m.accountExists(accountID) {
+		return fmt.Errorf("账号不存在: %s", accountID)
+	}
+
+	m.circuitMu.Lock()
+	defer m.circuitMu.Unlock()
+
+	cb, exists := m.circuitBreakers[accountID]
+	if !exists {
+		// 账号存在但没有熔断器记录，已经是 Closed 状态，幂等返回
+		return nil
+	}
+
+	cb.State = CircuitClosed
+	cb.FailureCount = 0
+	cb.SuccessCount = 0
+	return nil
+}
+
+// GetCircuitBreakerStates 获取所有账号的熔断器状态副本
+// 返回深拷贝，避免外部修改导致竞态
+func (m *AuthManager) GetCircuitBreakerStates() map[string]CircuitBreaker {
+	m.circuitMu.RLock()
+	defer m.circuitMu.RUnlock()
+
+	result := make(map[string]CircuitBreaker, len(m.circuitBreakers))
+	for id, cb := range m.circuitBreakers {
+		// 值拷贝，断开指针引用
+		result[id] = CircuitBreaker{
+			State:           cb.State,
+			FailureCount:    cb.FailureCount,
+			SuccessCount:    cb.SuccessCount,
+			LastFailureTime: cb.LastFailureTime,
+			OpenedAt:        cb.OpenedAt,
+			HalfOpenAt:      cb.HalfOpenAt,
+		}
+	}
+	return result
+}
+
+// GetLoadDistribution 获取所有账号的负载分布（权重和占比）
+// 遍历所有账号，计算每个账号的权重，然后算出百分比
+func (m *AuthManager) GetLoadDistribution() []AccountLoadInfo {
+	config := m.getAccountsFromCache()
+	if config == nil || len(config.Accounts) == 0 {
+		return nil
+	}
+
+	// 第一遍：收集所有账号的权重
+	type entry struct {
+		id     string
+		email  string
+		weight int
+	}
+	entries := make([]entry, 0, len(config.Accounts))
+	totalWeight := 0
+
+	for i := range config.Accounts {
+		acc := &config.Accounts[i]
+		w := m.calculateWeight(acc)
+		// 熔断中的账号权重归零，与 selectAccount 的过滤逻辑保持一致
+		if !m.isAccountAvailable(acc.ID) {
+			w = 0
+		}
+		entries = append(entries, entry{
+			id:     acc.ID,
+			email:  acc.Email,
+			weight: w,
+		})
+		totalWeight += w
+	}
+
+	// 第二遍：计算百分比
+	result := make([]AccountLoadInfo, len(entries))
+	for i, e := range entries {
+		var pct float64
+		if totalWeight > 0 {
+			pct = float64(e.weight) / float64(totalWeight) * 100
+		}
+		result[i] = AccountLoadInfo{
+			AccountID: e.id,
+			Email:     e.email,
+			Weight:    e.weight,
+			Percent:   pct,
+		}
+	}
+
+	return result
+}
+
+// accountExists 检查账号是否存在于配置中（内部辅助方法）
+func (m *AuthManager) accountExists(accountID string) bool {
+	config := m.getAccountsFromCache()
+	if config == nil {
+		return false
+	}
+	for _, acc := range config.Accounts {
+		if acc.ID == accountID {
+			return true
+		}
+	}
+	return false
 }

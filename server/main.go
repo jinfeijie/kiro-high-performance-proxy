@@ -175,6 +175,9 @@ var tokenStats TokenStats
 var tokenStatsMutex sync.RWMutex
 var tokenStatsChan = make(chan TokenDelta, 1000) // 异步写入通道
 
+// ========== 熔断错误率统计 ==========
+var circuitStats *CircuitStats
+
 // ========== 账号调用统计 ==========
 var accountStatsFile = "account-stats.json"
 var accountStats = make(map[string]*AccountStats) // accountID -> 统计
@@ -316,6 +319,23 @@ func recordAccountRequest(accountID, email string, statusCode int, errMsg string
 		return
 	}
 
+	// 记录到熔断错误率统计器（用于实时错误率计算）
+	if circuitStats != nil {
+		circuitStats.Record(accountID, statusCode >= 200 && statusCode < 300)
+
+		// 错误率过高时自动熔断（与手动熔断走同一套 ManualTrip 机制）
+		// 只在账号 Closed 状态时检查：
+		// - Open 状态已经熔断了，不需要重复触发
+		// - HalfOpen 状态正在试探恢复，不能用旧错误率数据打回去
+		if client != nil && client.Auth.IsAccountAvailable(accountID) && !client.Auth.IsAccountHalfOpen(accountID) {
+			cfg := client.Auth.GetCircuitConfig()
+			errorRate, totalReqs := circuitStats.GetErrorRate(accountID, 1)
+			if totalReqs >= cfg.ErrorRateMinReqs && errorRate >= cfg.ErrorRateThreshold {
+				client.Auth.ManualTrip(accountID)
+			}
+		}
+	}
+
 	accountStatsMutex.Lock()
 	defer accountStatsMutex.Unlock()
 
@@ -369,6 +389,153 @@ func getAccountStats() map[string]*AccountStats {
 		result[k] = v
 	}
 	return result
+}
+
+// ========== 熔断管理 API ==========
+
+// circuitStateToString 熔断器状态转英文字符串
+func circuitStateToString(state kiroclient.CircuitState) string {
+	switch state {
+	case kiroclient.CircuitOpen:
+		return "open"
+	case kiroclient.CircuitHalfOpen:
+		return "half_open"
+	default:
+		return "closed"
+	}
+}
+
+// circuitStateToLabel 熔断器状态转中文标签
+func circuitStateToLabel(state kiroclient.CircuitState) string {
+	switch state {
+	case kiroclient.CircuitOpen:
+		return "熔断"
+	case kiroclient.CircuitHalfOpen:
+		return "半开"
+	default:
+		return "正常"
+	}
+}
+
+// handleCircuitBreakerStatus 获取所有账号的熔断状态、错误率、负载比例
+// 聚合三个数据源：熔断器状态 + 错误率统计 + 负载分布
+func handleCircuitBreakerStatus(c *gin.Context) {
+	// 获取熔断器状态（值拷贝，线程安全）
+	cbStates := client.Auth.GetCircuitBreakerStates()
+
+	// 获取负载分布
+	loadDist := client.Auth.GetLoadDistribution()
+
+	// 构建 accountID -> loadInfo 的索引，避免 O(n^2) 查找
+	loadMap := make(map[string]kiroclient.AccountLoadInfo, len(loadDist))
+	for _, info := range loadDist {
+		loadMap[info.AccountID] = info
+	}
+
+	// 聚合所有账号数据（以负载分布为基准，因为它包含所有配置中的账号）
+	accounts := make([]map[string]any, 0, len(loadDist))
+	for _, info := range loadDist {
+		// 熔断器状态（可能不存在，默认 Closed）
+		cb, hasCB := cbStates[info.AccountID]
+
+		stateStr := "closed"
+		stateLabel := "正常"
+		var failureCount, successCount int
+		var lastFailureTime, openedAt int64
+
+		if hasCB {
+			stateStr = circuitStateToString(cb.State)
+			stateLabel = circuitStateToLabel(cb.State)
+			failureCount = cb.FailureCount
+			successCount = cb.SuccessCount
+			// 时间字段转 Unix 时间戳，零值时返回 0
+			if !cb.LastFailureTime.IsZero() {
+				lastFailureTime = cb.LastFailureTime.Unix()
+			}
+			if !cb.OpenedAt.IsZero() {
+				openedAt = cb.OpenedAt.Unix()
+			}
+		}
+
+		// 错误率统计（1分钟和5分钟窗口）
+		var errorRate1m, errorRate5m float64
+		var totalReq1m, totalReq5m int64
+		if circuitStats != nil {
+			errorRate1m, totalReq1m = circuitStats.GetErrorRate(info.AccountID, 1)
+			errorRate5m, totalReq5m = circuitStats.GetErrorRate(info.AccountID, 5)
+		}
+
+		accounts = append(accounts, map[string]any{
+			"accountId":       info.AccountID,
+			"email":           info.Email,
+			"state":           stateStr,
+			"stateLabel":      stateLabel,
+			"failureCount":    failureCount,
+			"successCount":    successCount,
+			"lastFailureTime": lastFailureTime,
+			"openedAt":        openedAt,
+			"errorRate1m":     errorRate1m,
+			"errorRate5m":     errorRate5m,
+			"totalRequests1m": totalReq1m,
+			"totalRequests5m": totalReq5m,
+			"weight":          info.Weight,
+			"loadPercent":     info.Percent,
+		})
+	}
+
+	c.JSON(200, gin.H{
+		"accounts":      accounts,
+		"totalAccounts": len(accounts),
+	})
+}
+
+// handleCircuitBreakerTrip 手动熔断指定账号
+func handleCircuitBreakerTrip(c *gin.Context) {
+	var req struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "参数格式错误"})
+		return
+	}
+
+	if err := client.Auth.ManualTrip(req.AccountID); err != nil {
+		// ManualTrip 返回错误说明账号不存在
+		c.JSON(404, gin.H{"error": "账号不存在"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"message": "账号已熔断",
+		"state":   "open",
+	})
+}
+
+// handleCircuitBreakerReset 手动解除熔断
+func handleCircuitBreakerReset(c *gin.Context) {
+	var req struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "参数格式错误"})
+		return
+	}
+
+	if err := client.Auth.ManualReset(req.AccountID); err != nil {
+		// ManualReset 返回错误说明账号不存在
+		c.JSON(404, gin.H{"error": "账号不存在"})
+		return
+	}
+
+	// 清除该账号的错误率统计数据，避免残留高错误率导致秒回熔断
+	if circuitStats != nil {
+		circuitStats.ClearAccount(req.AccountID)
+	}
+
+	c.JSON(200, gin.H{
+		"message": "熔断已解除",
+		"state":   "closed",
+	})
 }
 
 // handleGetAccountStats 获取账号统计 API
@@ -919,6 +1086,9 @@ func main() {
 	loadTokenStats()
 	go tokenStatsWorker()
 
+	// 初始化熔断错误率统计器
+	circuitStats = NewCircuitStats()
+
 	// 加载账号统计数据并启动后台写入协程
 	loadAccountStats()
 	go accountStatsWorker()
@@ -1016,6 +1186,11 @@ func main() {
 
 		// 账号统计
 		api.GET("/stats/accounts", handleGetAccountStats)
+
+		// 熔断管理
+		api.GET("/circuit-breaker/status", handleCircuitBreakerStatus)
+		api.POST("/circuit-breaker/trip", handleCircuitBreakerTrip)
+		api.POST("/circuit-breaker/reset", handleCircuitBreakerReset)
 
 		// Chat 接口
 		api.POST("/chat", handleChat)
@@ -1145,8 +1320,8 @@ func handleTokenConfig(c *gin.Context) {
 		os.Setenv("KIRO_AUTH_TOKEN_PATH", req.TokenPath)
 	}
 
-	// 重新初始化客户端
-	client = kiroclient.NewKiroClient()
+	// 重新初始化客户端（清除旧 token 缓存，但保留保活和账号缓存）
+	client.Auth.ClearTokenCache()
 
 	c.JSON(200, gin.H{"message": "Token 配置成功"})
 }
@@ -2823,8 +2998,14 @@ func handlePollLogin(c *gin.Context) {
 	delete(loginSessions, sessionID)
 	sessionMutex.Unlock()
 
-	// 重新初始化客户端以加载新 Token
-	client = kiroclient.NewKiroClient()
+	// 重新初始化账号缓存（不重建 client，避免丢失保活 goroutine）
+	if _, err := client.Auth.LoadAccountsConfigFromFile(); err != nil {
+		if logger != nil {
+			logger.Warn(GetMsgID(c), "登录后刷新账号缓存失败", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}
 
 	c.JSON(200, gin.H{
 		"status":  "success",
@@ -2950,8 +3131,14 @@ func handleRefreshAccount(c *gin.Context) {
 		return
 	}
 
-	// 重新初始化客户端
-	client = kiroclient.NewKiroClient()
+	// 刷新成功后重新加载缓存（不重建 client，避免丢失保活和账号缓存）
+	if _, err := client.Auth.LoadAccountsConfigFromFile(); err != nil {
+		if logger != nil {
+			logger.Warn(GetMsgID(c), "刷新后重载缓存失败", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}
 
 	c.JSON(200, gin.H{"message": "Token 已刷新"})
 }
