@@ -43,10 +43,22 @@ type CircuitStats struct {
 // ========== 构造函数 ==========
 
 // NewCircuitStats 创建全局错误率统计器
+// 启动后台清理协程,定期清理过期时间桶,防止内存泄漏
 func NewCircuitStats() *CircuitStats {
-	return &CircuitStats{
+	cs := &CircuitStats{
 		accounts: make(map[string]*AccountCircuitStats),
 	}
+
+	// 启动后台清理协程(每1分钟清理一次过期桶)
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cs.cleanup()
+		}
+	}()
+
+	return cs
 }
 
 // ClearAccount 清除指定账号的所有统计数据
@@ -142,8 +154,8 @@ func (cs *CircuitStats) GetErrorRate(accountID string, windowMinutes int) (float
 	for _, b := range acct.Buckets {
 		// 只汇总时间窗口内的桶
 		// 桶的结束时间 = Timestamp + bucketSeconds
-		// 桶至少部分落在窗口内才计入
-		if b.Timestamp+bucketSeconds > windowStart && b.Timestamp <= now {
+		// 桶至少部分落在窗口内才计入(修复边界条件:使用>=而不是>)
+		if b.Timestamp+bucketSeconds >= windowStart && b.Timestamp <= now {
 			totalSuccess += b.Success
 			totalFailure += b.Failure
 		}

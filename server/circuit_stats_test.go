@@ -372,3 +372,5 @@ func TestGetErrorRate_AllSuccess(t *testing.T) {
 		t.Errorf("错误率 = %f, want 0", errorRate)
 	}
 }
+
+// **Validates: Requirements 1.5 (并发安全)**

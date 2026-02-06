@@ -323,16 +323,12 @@ func recordAccountRequest(accountID, email string, statusCode int, errMsg string
 	if circuitStats != nil {
 		circuitStats.Record(accountID, statusCode >= 200 && statusCode < 300)
 
-		// 错误率过高时自动熔断（与手动熔断走同一套 ManualTrip 机制）
-		// 只在账号 Closed 状态时检查：
-		// - Open 状态已经熔断了，不需要重复触发
-		// - HalfOpen 状态正在试探恢复，不能用旧错误率数据打回去
-		if client != nil && client.Auth.IsAccountAvailable(accountID) && !client.Auth.IsAccountHalfOpen(accountID) {
-			cfg := client.Auth.GetCircuitConfig()
+		// 错误率过高时自动熔断(使用原子操作TryAutoTrip消除TOCTOU竞态)
+		// TryAutoTrip内部会在持有锁的情况下检查状态并触发熔断
+		if client != nil {
 			errorRate, totalReqs := circuitStats.GetErrorRate(accountID, 1)
-			if totalReqs >= cfg.ErrorRateMinReqs && errorRate >= cfg.ErrorRateThreshold {
-				client.Auth.ManualTrip(accountID)
-			}
+			// 原子化检查+熔断操作,避免竞态条件
+			client.Auth.TryAutoTrip(accountID, errorRate, totalReqs)
 		}
 	}
 
@@ -521,15 +517,16 @@ func handleCircuitBreakerReset(c *gin.Context) {
 		return
 	}
 
+	// 先清除统计数据,再重置熔断器(避免秒回熔断)
+	// 调整操作顺序保证原子性:清除高错误率数据后再开放账号
+	if circuitStats != nil {
+		circuitStats.ClearAccount(req.AccountID)
+	}
+
 	if err := client.Auth.ManualReset(req.AccountID); err != nil {
 		// ManualReset 返回错误说明账号不存在
 		c.JSON(404, gin.H{"error": "账号不存在"})
 		return
-	}
-
-	// 清除该账号的错误率统计数据，避免残留高错误率导致秒回熔断
-	if circuitStats != nil {
-		circuitStats.ClearAccount(req.AccountID)
 	}
 
 	c.JSON(200, gin.H{

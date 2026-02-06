@@ -243,8 +243,9 @@ func (m *AuthManager) recordFailure(accountID string) {
 	}
 
 	now := time.Now()
-	// 先保存上次失败时间用于窗口判断，再更新为当前时间
+	// 保存上次失败时间用于窗口判断(在更新前读取旧值)
 	prevFailureTime := cb.LastFailureTime
+	// 更新为当前时间
 	cb.LastFailureTime = now
 
 	switch cb.State {
@@ -1940,6 +1941,35 @@ func (m *AuthManager) IsAccountHalfOpen(accountID string) bool {
 // GetCircuitConfig 获取熔断器配置（供 server 包读取阈值）
 func (m *AuthManager) GetCircuitConfig() CircuitBreakerConfig {
 	return m.circuitConfig
+}
+
+// TryAutoTrip 尝试自动熔断(原子操作,消除TOCTOU竞态)
+// 在持有锁的情况下检查状态并触发熔断,避免竞态条件
+// 返回: 是否触发了熔断
+func (m *AuthManager) TryAutoTrip(accountID string, errorRate float64, totalReqs int64) bool {
+	m.circuitMu.Lock()
+	defer m.circuitMu.Unlock()
+
+	cb, exists := m.circuitBreakers[accountID]
+	if !exists {
+		cb = &CircuitBreaker{State: CircuitClosed}
+		m.circuitBreakers[accountID] = cb
+	}
+
+	// 只在Closed状态检查(HalfOpen状态正在试探恢复,不能用旧错误率数据打回去)
+	if cb.State != CircuitClosed {
+		return false
+	}
+
+	// 检查阈值
+	if totalReqs >= m.circuitConfig.ErrorRateMinReqs &&
+		errorRate >= m.circuitConfig.ErrorRateThreshold {
+		cb.State = CircuitOpen
+		cb.OpenedAt = time.Now()
+		return true
+	}
+
+	return false
 }
 
 // ManualTrip 手动熔断指定账号
