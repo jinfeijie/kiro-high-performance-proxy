@@ -43,8 +43,8 @@ func TestHandleModelsList(t *testing.T) {
 		t.Fatal("响应中没有 models 字段")
 	}
 
-	if len(models) != 5 {
-		t.Errorf("期望 5 个模型, 得到 %d", len(models))
+	if len(models) != 6 {
+		t.Errorf("期望 6 个模型, 得到 %d", len(models))
 	}
 }
 

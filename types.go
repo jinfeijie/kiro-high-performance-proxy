@@ -168,6 +168,12 @@ var AvailableModels = []Model{
 		Description: "Claude Sonnet 4.5",
 		Credit:      2.2,
 	},
+	{
+		ID:          "claude-opus-4.6",
+		Name:        "Claude Opus 4.6",
+		Description: "Experimental preview of Claude Opus 4.6",
+		Credit:      2.2,
+	},
 }
 
 // IsValidModel 检查模型 ID 是否有效
@@ -191,6 +197,9 @@ var DefaultModelMapping = ModelMapping{
 	// Claude Opus 4.5 映射
 	"claude-opus-4-5-20251101": "claude-opus-4.5",
 	"claude-opus-4-5":          "claude-opus-4.5",
+
+	// Claude Opus 4.6 映射
+	"claude-opus-4-6": "claude-opus-4.6",
 
 	// Claude Sonnet 4.5 映射
 	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
