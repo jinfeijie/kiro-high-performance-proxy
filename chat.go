@@ -816,15 +816,177 @@ func (s *ChatService) ChatStreamWithModelAndUsage(messages []ChatMessage, model 
 	return s.parseEventStream(resp.Body, callback)
 }
 
+// UTF8Buffer 处理跨消息边界的 UTF-8 字符
+// 当 UTF-8 多字节字符被拆分到不同的消息中时，需要缓冲不完整的字节
+type UTF8Buffer struct {
+	pending []byte // 待处理的不完整 UTF-8 字节
+}
+
+// ProcessBytes 处理原始字节，返回完整的 UTF-8 字符串
+// 如果字节末尾有不完整的 UTF-8 序列，会缓冲起来等待下一次调用
+func (b *UTF8Buffer) ProcessBytes(data []byte) string {
+	// 将待处理的字节和新数据合并
+	combined := append(b.pending, data...)
+	b.pending = nil
+
+	if len(combined) == 0 {
+		return ""
+	}
+
+	// 从末尾检查是否有不完整的 UTF-8 序列
+	// UTF-8 编码规则：
+	// - 0xxxxxxx: 单字节字符 (ASCII)
+	// - 110xxxxx 10xxxxxx: 2字节字符
+	// - 1110xxxx 10xxxxxx 10xxxxxx: 3字节字符 (中文常用)
+	// - 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx: 4字节字符
+
+	// 找到最后一个完整字符的位置
+	validEnd := len(combined)
+	for i := len(combined) - 1; i >= 0 && i >= len(combined)-4; i-- {
+		c := combined[i]
+		if c&0x80 == 0 {
+			// ASCII 字符，完整
+			break
+		}
+		if c&0xC0 == 0xC0 {
+			// 这是一个多字节序列的起始字节
+			// 计算期望的字节数
+			var expectedLen int
+			if c&0xF8 == 0xF0 {
+				expectedLen = 4
+			} else if c&0xF0 == 0xE0 {
+				expectedLen = 3
+			} else if c&0xE0 == 0xC0 {
+				expectedLen = 2
+			} else {
+				// 无效的起始字节
+				break
+			}
+
+			// 检查是否有足够的字节
+			remaining := len(combined) - i
+			if remaining < expectedLen {
+				// 不完整的序列，需要缓冲
+				validEnd = i
+				b.pending = make([]byte, len(combined)-i)
+				copy(b.pending, combined[i:])
+			}
+			break
+		}
+		// 继续检查前一个字节（这是一个续字节 10xxxxxx）
+	}
+
+	if validEnd == 0 {
+		return ""
+	}
+
+	return string(combined[:validEnd])
+}
+
+// Process 处理字符串，返回完整的 UTF-8 字符串（向后兼容）
+func (b *UTF8Buffer) Process(s string) string {
+	return b.ProcessBytes([]byte(s))
+}
+
+// Flush 刷新缓冲区，返回所有待处理的字节（可能包含不完整的 UTF-8）
+func (b *UTF8Buffer) Flush() string {
+	if len(b.pending) == 0 {
+		return ""
+	}
+	result := string(b.pending)
+	b.pending = nil
+	return result
+}
+
+// extractStringFieldFromPayload 从 JSON payload 中提取指定字段的原始字节
+// 避免 json.Unmarshal 将不完整的 UTF-8 字节转换为 \ufffd
+func extractStringFieldFromPayload(payload []byte, fieldName string) ([]byte, bool) {
+	// 查找 "fieldName":" 模式
+	fieldKey := []byte(`"` + fieldName + `":"`)
+	idx := bytes.Index(payload, fieldKey)
+	if idx == -1 {
+		return nil, false
+	}
+
+	// 跳过 "fieldName":"
+	start := idx + len(fieldKey)
+	if start >= len(payload) {
+		return nil, false
+	}
+
+	// 查找字符串结束位置（处理转义字符）
+	var result []byte
+	escaped := false
+	for i := start; i < len(payload); i++ {
+		c := payload[i]
+		if escaped {
+			// 处理转义字符
+			switch c {
+			case '"':
+				result = append(result, '"')
+			case '\\':
+				result = append(result, '\\')
+			case 'n':
+				result = append(result, '\n')
+			case 'r':
+				result = append(result, '\r')
+			case 't':
+				result = append(result, '\t')
+			case 'u':
+				// Unicode 转义 \uXXXX
+				if i+4 < len(payload) {
+					hex := string(payload[i+1 : i+5])
+					var r rune
+					fmt.Sscanf(hex, "%x", &r)
+					result = append(result, []byte(string(r))...)
+					i += 4
+				}
+			default:
+				result = append(result, c)
+			}
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			// 字符串结束
+			return result, true
+		}
+		result = append(result, c)
+	}
+
+	// 字符串未闭合，返回已解析的部分
+	return result, len(result) > 0
+}
+
+// extractContentFromPayload 从 JSON payload 中提取 content 字段的原始字节
+// 避免 json.Unmarshal 将不完整的 UTF-8 字节转换为 \ufffd
+func extractContentFromPayload(payload []byte) ([]byte, bool) {
+	return extractStringFieldFromPayload(payload, "content")
+}
+
+// extractTextFromPayload 从 JSON payload 中提取 text 字段的原始字节
+func extractTextFromPayload(payload []byte) ([]byte, bool) {
+	return extractStringFieldFromPayload(payload, "text")
+}
+
 // parseEventStream 解析 EventStream
 // 返回 KiroUsage 包含从 API 获取的精确 token 使用量
 func (s *ChatService) parseEventStream(body io.Reader, callback func(content string, done bool)) (*KiroUsage, error) {
 	usage := &KiroUsage{}
+	utf8Buffer := &UTF8Buffer{} // UTF-8 缓冲处理器
 
 	for {
 		msg, err := s.readEventStreamMessage(body)
 		if err != nil {
 			if err == io.EOF {
+				// 刷新缓冲区中剩余的内容
+				if remaining := utf8Buffer.Flush(); remaining != "" {
+					callback(remaining, false)
+				}
 				callback("", true)
 				return usage, nil
 			}
@@ -844,12 +1006,12 @@ func (s *ChatService) parseEventStream(body io.Reader, callback func(content str
 
 		// 解析 assistantResponseEvent（文本内容）
 		if eventType == "assistantResponseEvent" {
-			var event struct {
-				Content string `json:"content"`
-			}
-			if err := json.Unmarshal(msg.Payload, &event); err == nil {
-				if event.Content != "" {
-					callback(event.Content, false)
+			// 直接从原始 payload 提取 content 字节，避免 json.Unmarshal 损坏 UTF-8
+			if contentBytes, ok := extractContentFromPayload(msg.Payload); ok && len(contentBytes) > 0 {
+				// 使用 UTF-8 缓冲处理器处理原始字节
+				processed := utf8Buffer.ProcessBytes(contentBytes)
+				if processed != "" {
+					callback(processed, false)
 				}
 			}
 		}
@@ -1099,14 +1261,17 @@ func (p *ThinkingTextProcessor) ProcessText(text string, forceFlush bool) {
 				p.inThinkingBlock = true
 			} else if forceFlush || len(p.buffer) > 50 {
 				// 没有找到标签，安全输出（保留可能的部分标签）
-				safeLength := len(p.buffer)
+				// 使用 rune 计算字符数，避免截断 UTF-8 多字节字符
+				runes := []rune(p.buffer)
+				safeRuneLength := len(runes)
 				if !forceFlush {
-					safeLength = max(0, len(p.buffer)-15)
+					// 保留最后 15 个字符（而不是字节）以检测部分标签
+					safeRuneLength = max(0, len(runes)-15)
 				}
-				if safeLength > 0 {
-					safeText := p.buffer[:safeLength]
+				if safeRuneLength > 0 {
+					safeText := string(runes[:safeRuneLength])
 					p.Callback(safeText, false)
-					p.buffer = p.buffer[safeLength:]
+					p.buffer = string(runes[safeRuneLength:])
 				}
 				break
 			} else {
@@ -1286,6 +1451,7 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 // 返回 KiroUsage 包含从 API 获取的精确 token 使用量
 func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUseCallback) (*KiroUsage, error) {
 	usage := &KiroUsage{}
+	utf8Buffer := &UTF8Buffer{} // UTF-8 缓冲处理器
 
 	// 工具调用状态跟踪
 	var currentToolUse *struct {
@@ -1299,6 +1465,10 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 		msg, err := s.readEventStreamMessage(body)
 		if err != nil {
 			if err == io.EOF {
+				// 刷新 UTF-8 缓冲区中剩余的内容
+				if remaining := utf8Buffer.Flush(); remaining != "" {
+					callback(remaining, nil, false, false)
+				}
 				// 完成未处理的工具调用
 				if currentToolUse != nil && !processedIds[currentToolUse.ToolUseId] {
 					input, ok := parseToolInput(currentToolUse.InputBuffer)
@@ -1333,12 +1503,12 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 
 		// 解析 assistantResponseEvent（文本内容）
 		if eventType == "assistantResponseEvent" {
-			var event struct {
-				Content string `json:"content"`
-			}
-			if err := json.Unmarshal(msg.Payload, &event); err == nil {
-				if event.Content != "" {
-					callback(event.Content, nil, false, false)
+			// 直接从原始 payload 提取 content 字节，避免 json.Unmarshal 损坏 UTF-8
+			if contentBytes, ok := extractContentFromPayload(msg.Payload); ok && len(contentBytes) > 0 {
+				// 使用 UTF-8 缓冲处理器处理原始字节
+				processed := utf8Buffer.ProcessBytes(contentBytes)
+				if processed != "" {
+					callback(processed, nil, false, false)
 				}
 			}
 		}
@@ -1380,14 +1550,16 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 		// 解析 reasoningContentEvent（Thinking 模式推理内容）
 		// 参考 Kiro-account-manager kiroApi.ts reasoningContentEvent 处理
 		if eventType == "reasoningContentEvent" {
-			var event struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(msg.Payload, &event); err == nil && event.Text != "" {
-				// isThinking=true 标记这是思考内容
-				callback(event.Text, nil, false, true)
+			// 直接从原始 payload 提取 text 字节，避免 json.Unmarshal 损坏 UTF-8
+			if textBytes, ok := extractTextFromPayload(msg.Payload); ok && len(textBytes) > 0 {
+				// 使用 UTF-8 缓冲处理器处理原始字节
+				processed := utf8Buffer.ProcessBytes(textBytes)
+				if processed != "" {
+					// isThinking=true 标记这是思考内容
+					callback(processed, nil, false, true)
+				}
 				// 累计 reasoning tokens
-				usage.ReasoningTokens += len(event.Text) / 3
+				usage.ReasoningTokens += len(textBytes) / 3
 			}
 		}
 
