@@ -19,6 +19,7 @@ const (
 	INFO
 	WARN
 	ERROR
+	NONE // 关闭所有日志
 )
 
 // String 返回日志级别的字符串表示
@@ -32,6 +33,8 @@ func (l LogLevel) String() string {
 		return "WARN"
 	case ERROR:
 		return "ERROR"
+	case NONE:
+		return "NONE"
 	default:
 		return "UNKNOWN"
 	}
@@ -60,7 +63,7 @@ type StructuredLogger struct {
 
 // 默认配置常量
 const (
-	DefaultLogLevel = INFO // 默认 INFO 级别（线上推荐）
+	DefaultLogLevel = NONE // 默认关闭所有日志
 )
 
 // ParseLogLevel 从字符串解析日志级别
@@ -74,6 +77,8 @@ func ParseLogLevel(s string) LogLevel {
 		return WARN
 	case "ERROR":
 		return ERROR
+	case "NONE", "OFF":
+		return NONE
 	default:
 		return INFO // 默认 INFO
 	}
