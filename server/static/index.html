@@ -1472,6 +1472,10 @@
                         actionButtons = `<button onclick="tripAccount('${acc.accountId}')" class="flex-1 px-3 py-1.5 bg-red-500 text-white text-sm rounded hover:bg-red-600 transition"><i class="fas fa-ban mr-1"></i>熔断</button>
                             <button onclick="resetAccount('${acc.accountId}')" class="px-3 py-1.5 border border-green-300 text-green-500 text-sm rounded hover:bg-green-50 transition"><i class="fas fa-unlock mr-1"></i>解除熔断</button>`;
                     }
+                    // 构建权重和负载比例的tooltip说明
+                    const weightTooltip = `权重计算：(1 - 已用额度/总额度) × 100\n剩余额度越多，权重越高（0-100）\n当前权重：${acc.weight}`;
+                    const loadTooltip = `负载比例 = (账号权重 / 所有账号权重之和) × 100%\n表示该账号在负载均衡中被选中的概率\n当前比例：${acc.loadPercent.toFixed(1)}%`;
+                    
                     return `<div class="bg-white border rounded-lg p-4 shadow-sm">
                         <div class="flex items-center justify-between mb-3">
                             <span class="font-medium text-gray-800">${acc.email || acc.accountId}</span>
@@ -1480,8 +1484,8 @@
                         <div class="grid grid-cols-2 gap-2 text-sm text-gray-600 mb-3">
                             <div>1分钟错误率: <span class="font-medium">${acc.errorRate1m.toFixed(1)}%</span></div>
                             <div>5分钟错误率: <span class="font-medium">${acc.errorRate5m.toFixed(1)}%</span></div>
-                            <div>负载比例: <span class="font-medium">${acc.loadPercent.toFixed(1)}%</span></div>
-                            <div>权重: <span class="font-medium">${acc.weight}</span></div>
+                            <div class="cursor-help" title="${loadTooltip}">负载比例: <span class="font-medium">${acc.loadPercent.toFixed(1)}%</span> <i class="fas fa-question-circle text-gray-400 text-xs"></i></div>
+                            <div class="cursor-help" title="${weightTooltip}">权重: <span class="font-medium">${acc.weight}</span> <i class="fas fa-question-circle text-gray-400 text-xs"></i></div>
                         </div>
                         <div class="flex gap-2">
                             ${actionButtons}
