@@ -48,8 +48,10 @@ func TraceMiddleware(logger *StructuredLogger) gin.HandlerFunc {
 			msgID = generateID("msg")
 		}
 
-		// 2. 将 msgId 存入 Gin context
+		// 2. 将 msgId 存入 Gin context 和 Go 标准 context
+		// 同时注入到 c.Request.Context()，因为 handler 传给 ChatService 的是标准 context
 		c.Set(MsgIDKey, msgID)
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), MsgIDKey, msgID))
 
 		// 3. 保存请求体到 context（用于错误记录）
 		// 需要读取后重新设置，因为 Body 只能读取一次

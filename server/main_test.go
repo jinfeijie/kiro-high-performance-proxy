@@ -560,3 +560,253 @@ func TestProperty3_CircuitBreakerStatusResponseCompleteness(t *testing.T) {
 		t.Errorf("Property 3 失败: %v", err)
 	}
 }
+
+func TestValidateToolUseInput(t *testing.T) {
+	// 构造工具定义：Write 工具需要 file_path 和 content
+	tools := []kiroclient.KiroToolWrapper{
+		{
+			ToolSpecification: kiroclient.KiroToolSpecification{
+				Name: "Write",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"required": []interface{}{
+						"file_path",
+						"content",
+					},
+					"properties": map[string]interface{}{
+						"file_path": map[string]interface{}{
+							"type": "string",
+						},
+						"content": map[string]interface{}{
+							"type": "string",
+						},
+					},
+				},
+			},
+		},
+		{
+			ToolSpecification: kiroclient.KiroToolSpecification{
+				Name: "Read",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"path": map[string]interface{}{
+							"type": "string",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		toolName string
+		input    map[string]any
+		wantLen  int
+	}{
+		{
+			name:     "全部参数齐全-通过",
+			toolName: "Write",
+			input:    map[string]any{"file_path": "/a", "content": "b"},
+			wantLen:  0,
+		},
+		{
+			name:     "缺少content-拦截",
+			toolName: "Write",
+			input:    map[string]any{"file_path": "/a"},
+			wantLen:  1,
+		},
+		{
+			name:     "全部缺失-拦截",
+			toolName: "Write",
+			input:    map[string]any{},
+			wantLen:  2,
+		},
+		{
+			name:     "工具无required定义-放行",
+			toolName: "Read",
+			input:    map[string]any{},
+			wantLen:  0,
+		},
+		{
+			name:     "未知工具-放行",
+			toolName: "Unknown",
+			input:    map[string]any{},
+			wantLen:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			missing := validateToolUseInput(tt.toolName, tt.input, tools)
+			if len(missing) != tt.wantLen {
+				t.Errorf("want %d missing, got %d: %v", tt.wantLen, len(missing), missing)
+			}
+		})
+	}
+}
+
+func TestPatchMissingFields(t *testing.T) {
+	tools := []kiroclient.KiroToolWrapper{
+		{
+			ToolSpecification: kiroclient.KiroToolSpecification{
+				Name: "Write",
+				InputSchema: map[string]interface{}{
+					"type":     "object",
+					"required": []interface{}{"file_path", "content"},
+					"properties": map[string]interface{}{
+						"file_path": map[string]interface{}{"type": "string"},
+						"content":   map[string]interface{}{"type": "string"},
+					},
+				},
+			},
+		},
+		{
+			ToolSpecification: kiroclient.KiroToolSpecification{
+				Name: "Multi",
+				InputSchema: map[string]interface{}{
+					"type":     "object",
+					"required": []interface{}{"name", "count", "flag", "items", "meta"},
+					"properties": map[string]interface{}{
+						"name":  map[string]interface{}{"type": "string"},
+						"count": map[string]interface{}{"type": "integer"},
+						"flag":  map[string]interface{}{"type": "boolean"},
+						"items": map[string]interface{}{"type": "array"},
+						"meta":  map[string]interface{}{"type": "object"},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		toolName string
+		input    map[string]any
+		missing  []string
+		wantKey  string
+		wantVal  any
+	}{
+		{
+			name:     "补齐string类型content",
+			toolName: "Write",
+			input:    map[string]any{"file_path": "/a"},
+			missing:  []string{"content"},
+			wantKey:  "content",
+			wantVal:  "「模型未知原因导致字段: content 缺失，建议重试。注意添加提示词：`分段写入，减少失败。` 」",
+		},
+		{
+			name:     "补齐integer类型",
+			toolName: "Multi",
+			input:    map[string]any{"name": "x"},
+			missing:  []string{"count"},
+			wantKey:  "count",
+			wantVal:  0,
+		},
+		{
+			name:     "补齐boolean类型",
+			toolName: "Multi",
+			input:    map[string]any{"name": "x"},
+			missing:  []string{"flag"},
+			wantKey:  "flag",
+			wantVal:  false,
+		},
+		{
+			name:     "补齐array类型",
+			toolName: "Multi",
+			input:    map[string]any{"name": "x"},
+			missing:  []string{"items"},
+			wantKey:  "items",
+			wantVal:  nil, // array 用 len 检查
+		},
+		{
+			name:     "已有字段不覆盖",
+			toolName: "Write",
+			input:    map[string]any{"file_path": "/a", "content": "abc"},
+			missing:  []string{},
+			wantKey:  "content",
+			wantVal:  "abc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			patchMissingFields(tt.input, tt.missing, tools, tt.toolName)
+			val, has := tt.input[tt.wantKey]
+			if !has {
+				if tt.wantVal != nil {
+					t.Errorf("字段 %s 未被补齐", tt.wantKey)
+				}
+				return
+			}
+			// array 类型特殊处理
+			if tt.wantKey == "items" {
+				arr, ok := val.([]any)
+				if !ok || len(arr) != 0 {
+					t.Errorf("want empty array, got %v", val)
+				}
+				return
+			}
+			if val != tt.wantVal {
+				t.Errorf("want %v (%T), got %v (%T)", tt.wantVal, tt.wantVal, val, val)
+			}
+		})
+	}
+}
+
+// ========== containsDebugKeyword 测试 ==========
+
+func TestContainsDebugKeyword_Found(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "请帮我 OneDayAI_Start_Debug 调试一下"},
+	}
+	if !containsDebugKeyword(messages) {
+		t.Error("应该检测到关键字")
+	}
+}
+
+func TestContainsDebugKeyword_NotFound(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "普通消息"},
+	}
+	if containsDebugKeyword(messages) {
+		t.Error("不应该检测到关键字")
+	}
+}
+
+func TestContainsDebugKeyword_Empty(t *testing.T) {
+	if containsDebugKeyword(nil) {
+		t.Error("nil 不应该检测到关键字")
+	}
+	if containsDebugKeyword([]map[string]any{}) {
+		t.Error("空数组不应该检测到关键字")
+	}
+}
+
+func TestContainsDebugKeyword_InNestedContent(t *testing.T) {
+	// Claude 格式：content 是数组
+	messages := []map[string]any{
+		{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "OneDayAI_Start_Debug"},
+			},
+		},
+	}
+	if !containsDebugKeyword(messages) {
+		t.Error("嵌套内容中应该检测到关键字")
+	}
+}
+
+func TestContainsDebugKeyword_MultipleMessages(t *testing.T) {
+	// 关键字在第二条消息中
+	messages := []map[string]any{
+		{"role": "user", "content": "第一条普通消息"},
+		{"role": "assistant", "content": "回复"},
+		{"role": "user", "content": "OneDayAI_Start_Debug 第三条"},
+	}
+	if !containsDebugKeyword(messages) {
+		t.Error("多条消息中应该检测到关键字")
+	}
+}

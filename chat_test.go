@@ -1631,7 +1631,7 @@ func TestProperty5_SkipBehaviorCorrectness(t *testing.T) {
 		unfixableInputs := generateUnfixableJSONInputs(r)
 
 		for _, input := range unfixableInputs {
-			result, ok := parseToolInput(input)
+			result, ok, _ := parseToolInput(input)
 
 			// 核心属性1：无法修复的 JSON 应返回 ok=false
 			if ok {
@@ -1727,7 +1727,7 @@ func TestProperty5_SyntaxErrorReturnsNilFalse(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, ok := parseToolInput(tc.input)
+			result, ok, _ := parseToolInput(tc.input)
 
 			// 语法错误应返回 (nil, false)
 			if ok {
@@ -1761,7 +1761,7 @@ func TestProperty5_NoErrorFieldsInResult(t *testing.T) {
 		jsonStr := jsonValueToString(v)
 
 		// 测试完整 JSON
-		result, ok := parseToolInput(jsonStr)
+		result, ok, _ := parseToolInput(jsonStr)
 		if ok && result != nil {
 			if _, hasError := result["_error"]; hasError {
 				t.Logf("完整 JSON 结果包含 _error: %s", jsonStr)
@@ -1776,7 +1776,7 @@ func TestProperty5_NoErrorFieldsInResult(t *testing.T) {
 		// 测试截断 JSON
 		if len(jsonStr) > 2 {
 			truncated := jsonStr[:len(jsonStr)-1]
-			result, ok := parseToolInput(truncated)
+			result, ok, _ := parseToolInput(truncated)
 			if ok && result != nil {
 				if _, hasError := result["_error"]; hasError {
 					t.Logf("截断 JSON 结果包含 _error: %s", truncated)
@@ -1813,7 +1813,7 @@ func TestProperty5_UnfixableTruncationReturnsNilFalse(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, ok := parseToolInput(tc.input)
+			result, ok, _ := parseToolInput(tc.input)
 
 			// 无论是否能修复，结果都不应包含错误字段
 			if result != nil {
@@ -1869,7 +1869,7 @@ func TestProperty9_BackwardCompatibility(t *testing.T) {
 		}
 
 		// 使用 parseToolInput 解析
-		result, ok := parseToolInput(jsonStr)
+		result, ok, _ := parseToolInput(jsonStr)
 
 		// 核心属性1：有效 JSON 应返回 ok=true
 		if !ok {
@@ -1898,7 +1898,7 @@ func TestProperty9_BackwardCompatibility(t *testing.T) {
 // **Feature: tool-input-json-fix, Property 9: 向后兼容性 - 空输入**
 func TestProperty9_EmptyInputCompatibility(t *testing.T) {
 	// 空字符串应返回空 map 和 true
-	result, ok := parseToolInput("")
+	result, ok, _ := parseToolInput("")
 
 	if !ok {
 		t.Error("空字符串应返回 ok=true")
@@ -1948,7 +1948,7 @@ func TestProperty9_ValidJSONTypes(t *testing.T) {
 			}
 
 			// 使用 parseToolInput 解析
-			result, ok := parseToolInput(tc.input)
+			result, ok, _ := parseToolInput(tc.input)
 
 			if !ok {
 				t.Errorf("有效 JSON 应返回 ok=true，输入: %s", tc.input)
@@ -1992,7 +1992,7 @@ func TestProperty9_ComplexNestedStructures(t *testing.T) {
 			return true
 		}
 
-		result, ok := parseToolInput(jsonStr)
+		result, ok, _ := parseToolInput(jsonStr)
 
 		if !ok {
 			t.Logf("复杂嵌套 JSON 返回 ok=false: %s", jsonStr)
@@ -2040,7 +2040,7 @@ func TestProperty9_LargeJSONObjects(t *testing.T) {
 			return true
 		}
 
-		result, ok := parseToolInput(jsonStr)
+		result, ok, _ := parseToolInput(jsonStr)
 
 		if !ok {
 			t.Logf("大型 JSON 返回 ok=false")
@@ -2086,7 +2086,7 @@ func TestProperty9_SpecialCharacters(t *testing.T) {
 				t.Fatalf("标准 JSON 解析失败: %v", err)
 			}
 
-			result, ok := parseToolInput(tc.input)
+			result, ok, _ := parseToolInput(tc.input)
 
 			if !ok {
 				t.Errorf("有效 JSON 应返回 ok=true")
@@ -2144,7 +2144,7 @@ func TestProperty6_ContinuityAfterUnfixable(t *testing.T) {
 
 		// 模拟处理每个工具调用
 		for _, ti := range toolInputs {
-			result, ok := parseToolInput(ti.input)
+			result, ok, _ := parseToolInput(ti.input)
 
 			// 验证结果符合预期
 			if ti.expected {
@@ -2223,7 +2223,7 @@ func TestProperty6_MultipleToolCallsSequence(t *testing.T) {
 				expectSuccess = true
 			}
 
-			result, ok := parseToolInput(input)
+			result, ok, _ := parseToolInput(input)
 
 			if expectSuccess {
 				if ok && result != nil {
@@ -2279,7 +2279,7 @@ func TestProperty6_FailureThenSuccess(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// 第一个调用应该失败
-			result1, ok1 := parseToolInput(tc.failedInput)
+			result1, ok1, _ := parseToolInput(tc.failedInput)
 			if ok1 && result1 != nil {
 				// 如果修复成功了，检查没有错误字段
 				if _, hasError := result1["_error"]; hasError {
@@ -2288,7 +2288,7 @@ func TestProperty6_FailureThenSuccess(t *testing.T) {
 			}
 
 			// 第二个调用应该成功
-			result2, ok2 := parseToolInput(tc.successInput)
+			result2, ok2, _ := parseToolInput(tc.successInput)
 			if !ok2 {
 				t.Errorf("有效 JSON 应该返回 ok=true")
 			}
@@ -2322,7 +2322,7 @@ func TestProperty6_InterleavedSuccessFailure(t *testing.T) {
 	}
 
 	for i, s := range sequence {
-		result, ok := parseToolInput(s.input)
+		result, ok, _ := parseToolInput(s.input)
 
 		if s.expected {
 			if !ok {
@@ -2799,4 +2799,119 @@ func TestProperty8_LogToolSkippedFunction(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ========== IsDebugMode / GetMsgIdFromCtx / DebugLog 测试 ==========
+
+func TestIsDebugMode_True(t *testing.T) {
+	ctx := context.WithValue(context.Background(), DebugModeKey, true)
+	if !IsDebugMode(ctx) {
+		t.Error("应该返回 true")
+	}
+}
+
+func TestIsDebugMode_False(t *testing.T) {
+	ctx := context.WithValue(context.Background(), DebugModeKey, false)
+	if IsDebugMode(ctx) {
+		t.Error("应该返回 false")
+	}
+}
+
+func TestIsDebugMode_NotSet(t *testing.T) {
+	ctx := context.Background()
+	if IsDebugMode(ctx) {
+		t.Error("未设置时应该返回 false")
+	}
+}
+
+func TestIsDebugMode_WrongType(t *testing.T) {
+	// 值不是 bool 类型
+	ctx := context.WithValue(context.Background(), DebugModeKey, "true")
+	if IsDebugMode(ctx) {
+		t.Error("非 bool 类型应该返回 false")
+	}
+}
+
+func TestGetMsgIdFromCtx_Set(t *testing.T) {
+	ctx := context.WithValue(context.Background(), "msgId", "test-123")
+	got := GetMsgIdFromCtx(ctx)
+	if got != "test-123" {
+		t.Errorf("期望 test-123, got %s", got)
+	}
+}
+
+func TestGetMsgIdFromCtx_NotSet(t *testing.T) {
+	ctx := context.Background()
+	got := GetMsgIdFromCtx(ctx)
+	if got != "unknown" {
+		t.Errorf("未设置时应返回 unknown, got %s", got)
+	}
+}
+
+func TestGetMsgIdFromCtx_WrongType(t *testing.T) {
+	ctx := context.WithValue(context.Background(), "msgId", 12345)
+	got := GetMsgIdFromCtx(ctx)
+	if got != "unknown" {
+		t.Errorf("非 string 类型应返回 unknown, got %s", got)
+	}
+}
+
+// mockLogger 用于测试 DebugLog 的 mock 日志记录器
+type mockLogger struct {
+	debugCalled      bool
+	forceDebugCalled bool
+	lastMsgId        string
+	lastMessage      string
+}
+
+func (m *mockLogger) Debug(msgId, message string, data map[string]any) {
+	m.debugCalled = true
+	m.lastMsgId = msgId
+	m.lastMessage = message
+}
+func (m *mockLogger) Info(msgId, message string, data map[string]any)  {}
+func (m *mockLogger) Warn(msgId, message string, data map[string]any)  {}
+func (m *mockLogger) Error(msgId, message string, data map[string]any) {}
+func (m *mockLogger) ForceDebug(msgId, message string, data map[string]any) {
+	m.forceDebugCalled = true
+	m.lastMsgId = msgId
+	m.lastMessage = message
+}
+
+func TestDebugLog_NormalMode(t *testing.T) {
+	// 非 debug 模式，应调用 Debug
+	ctx := context.WithValue(context.Background(), "msgId", "msg-001")
+	ml := &mockLogger{}
+	DebugLog(ctx, ml, "测试消息", nil)
+
+	if !ml.debugCalled {
+		t.Error("非 debug 模式应调用 Debug")
+	}
+	if ml.forceDebugCalled {
+		t.Error("非 debug 模式不应调用 ForceDebug")
+	}
+	if ml.lastMsgId != "msg-001" {
+		t.Errorf("msgId 应为 msg-001, got %s", ml.lastMsgId)
+	}
+}
+
+func TestDebugLog_DebugMode(t *testing.T) {
+	// debug 模式，应调用 ForceDebug
+	ctx := context.WithValue(context.Background(), DebugModeKey, true)
+	ctx = context.WithValue(ctx, "msgId", "msg-002")
+	ml := &mockLogger{}
+	DebugLog(ctx, ml, "debug消息", nil)
+
+	if !ml.forceDebugCalled {
+		t.Error("debug 模式应调用 ForceDebug")
+	}
+	if ml.debugCalled {
+		t.Error("debug 模式不应调用 Debug")
+	}
+}
+
+func TestDebugLog_NilLogger(t *testing.T) {
+	// logger 为 nil 不应 panic
+	ctx := context.Background()
+	DebugLog(ctx, nil, "不应panic", nil)
 }

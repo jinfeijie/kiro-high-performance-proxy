@@ -17,6 +17,51 @@ import (
 
 const RequestBodyKey = "requestBody"
 
+// TraceLogger 日志接口（避免 server 包和 kiroclient 包循环依赖）
+type TraceLogger interface {
+	Debug(msgId, message string, data map[string]any)
+	Info(msgId, message string, data map[string]any)
+	Warn(msgId, message string, data map[string]any)
+	Error(msgId, message string, data map[string]any)
+	ForceDebug(msgId, message string, data map[string]any)
+}
+
+// DebugModeKey context key，用于标记当前请求是否开启了 debug 模式
+// 当消息中包含 OneDayAI_Start_Debug 关键字时，设置为 true
+const DebugModeKey = "debugMode"
+
+// IsDebugMode 从 context 中判断是否开启了 debug 模式
+// 导出给 server 包使用
+func IsDebugMode(ctx context.Context) bool {
+	if v := ctx.Value(DebugModeKey); v != nil {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+// GetMsgIdFromCtx 从 context 中获取 msgId（导出版本）
+// 导出给 server 包使用，避免重复实现
+func GetMsgIdFromCtx(ctx context.Context) string {
+	return getMsgIdFromCtx(ctx)
+}
+
+// DebugLog 统一的 debug 日志封装
+// 如果 debug 模式开启，用 ForceDebug 强制输出；否则走正常 Debug 级别
+// 导出给 server 包使用，两个包共用同一套逻辑
+func DebugLog(ctx context.Context, logger TraceLogger, msg string, data map[string]any) {
+	if logger == nil {
+		return
+	}
+	msgId := getMsgIdFromCtx(ctx)
+	if IsDebugMode(ctx) {
+		logger.ForceDebug(msgId, msg, data)
+		return
+	}
+	logger.Debug(msgId, msg, data)
+}
+
 // TruncationType 截断类型
 // 用于标识 JSON 字符串被截断的方式，便于后续修复处理
 type TruncationType int
@@ -639,6 +684,7 @@ type ChatService struct {
 	httpClient  *http.Client
 	machineID   string
 	version     string
+	logger      TraceLogger // 链路日志（可选，由 server 层注入）
 }
 
 // NewChatService 创建聊天服务
@@ -651,6 +697,21 @@ func NewChatService(authManager *AuthManager) *ChatService {
 		machineID:   generateMachineID(),
 		version:     "0.8.140",
 	}
+}
+
+// SetLogger 注入日志记录器（由 server 层调用）
+func (s *ChatService) SetLogger(logger TraceLogger) {
+	s.logger = logger
+}
+
+// getMsgIdFromCtx 从 context 中获取 msgId
+func getMsgIdFromCtx(ctx context.Context) string {
+	if v := ctx.Value("msgId"); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return "unknown"
 }
 
 // generateConversationID 生成会话 ID
@@ -858,6 +919,11 @@ func (s *ChatService) ChatStreamWithModelAndUsage(ctx context.Context, messages 
 		return nil, err
 	}
 
+	// 【包2】记录发给 Kiro API 的请求 body
+	DebugLog(ctx, s.logger, "【包2】发给Kiro API", map[string]any{
+		"body": string(body),
+	})
+
 	// 确定 endpoint
 	region := s.authManager.GetRegion()
 	var endpoint string
@@ -886,20 +952,11 @@ func (s *ChatService) ChatStreamWithModelAndUsage(ctx context.Context, messages 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		// 详细错误日志：记录完整的请求链路数据
-		if IsErrorLog(err) {
-
-			w, _ := io.ReadAll(resp.Body)
-			resp.Body = io.NopCloser(bytes.NewBuffer(w))
-
-			logMap := map[string]string{
-				"originReq": ctx.Value(RequestBodyKey).(string),
-				"kiroReq":   string(body),
-				"kiroResp":  string(w),
-				"err":       err.Error(),
-			}
-
-			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		// 【包3】HTTP 请求失败
+		if s.logger != nil {
+			s.logger.Error(getMsgIdFromCtx(ctx), "【包3】Kiro API请求失败", map[string]any{
+				"error": err.Error(),
+			})
 		}
 		// 客户端超时等非服务端故障不触发熔断
 		if !IsNonCircuitBreakingError(err) {
@@ -915,17 +972,12 @@ func (s *ChatService) ChatStreamWithModelAndUsage(ctx context.Context, messages 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		reqErr := fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
 
-		// 详细错误日志：记录完整的请求链路数据
-		if IsErrorLog(err) {
-
-			logMap := map[string]string{
-				"originReq": ctx.Value(RequestBodyKey).(string),
-				"kiroReq":   string(body),
-				"kiroResp":  string(bodyBytes),
-				"err":       err.Error(),
-			}
-
-			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		// 【包3】Kiro API 返回非200
+		if s.logger != nil {
+			s.logger.Error(getMsgIdFromCtx(ctx), "【包3】Kiro API返回非200", map[string]any{
+				"statusCode": resp.StatusCode,
+				"body":       string(bodyBytes),
+			})
 		}
 		// 客户端参数错误（400）不触发熔断
 		if !IsNonCircuitBreakingError(reqErr) {
@@ -934,11 +986,29 @@ func (s *ChatService) ChatStreamWithModelAndUsage(ctx context.Context, messages 
 		return nil, reqErr
 	}
 
+	// 记录请求成功（headers）
+	if s.logger != nil {
+		headers := make(map[string]string)
+		for k, v := range resp.Header {
+			if len(v) > 0 {
+				headers[k] = v[0]
+			}
+		}
+		DebugLog(ctx, s.logger, "【包3】Kiro API返回成功", map[string]any{
+			"statusCode":  resp.StatusCode,
+			"contentType": resp.Header.Get("Content-Type"),
+			"requestId":   resp.Header.Get("x-amzn-RequestId"),
+			"headers":     headers,
+		})
+	}
+
 	// 记录请求成功
 	s.authManager.RecordRequestResult(accountID, true)
 
-	// 解析 EventStream
-	return s.parseEventStream(resp.Body, callback)
+	// 解析 EventStream（每个事件的 payload 在 parseEventStream 内逐条记录）
+	usage, parseErr := s.parseEventStream(ctx, resp.Body, callback)
+
+	return usage, parseErr
 }
 
 // UTF8Buffer 处理跨消息边界的 UTF-8 字符
@@ -1100,7 +1170,7 @@ func extractTextFromPayload(payload []byte) ([]byte, bool) {
 
 // parseEventStream 解析 EventStream
 // 返回 KiroUsage 包含从 API 获取的精确 token 使用量
-func (s *ChatService) parseEventStream(body io.Reader, callback func(content string, done bool)) (*KiroUsage, error) {
+func (s *ChatService) parseEventStream(ctx context.Context, body io.Reader, callback func(content string, done bool)) (*KiroUsage, error) {
 	usage := &KiroUsage{}
 	utf8Buffer := &UTF8Buffer{} // UTF-8 缓冲处理器
 
@@ -1128,6 +1198,21 @@ func (s *ChatService) parseEventStream(body io.Reader, callback func(content str
 		}
 
 		eventType := msg.Headers[":event-type"]
+
+		// 【包3】记录每个 EventStream 事件的原始 payload
+		// 先检查 payload 是否为合法 JSON，是则直接嵌入（避免双重转义），否则用 string 降级
+		if s.logger != nil {
+			var payloadVal any
+			if json.Valid(msg.Payload) {
+				payloadVal = json.RawMessage(msg.Payload)
+			} else {
+				payloadVal = string(msg.Payload)
+			}
+			DebugLog(ctx, s.logger, "【包3】EventStream事件", map[string]any{
+				"eventType": eventType,
+				"payload":   payloadVal,
+			})
+		}
 
 		// 解析 assistantResponseEvent（文本内容）
 		if eventType == "assistantResponseEvent" {
@@ -1532,6 +1617,11 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 		return nil, err
 	}
 
+	// 【包2】记录发给 Kiro API 的请求 body
+	DebugLog(ctx, s.logger, "【包2】发给Kiro API(Tools)", map[string]any{
+		"body": string(body),
+	})
+
 	region := s.authManager.GetRegion()
 	var endpoint string
 	if region == "eu-central-1" {
@@ -1558,22 +1648,12 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-
-		if IsErrorLog(err) {
-
-			w, _ := io.ReadAll(resp.Body)
-			resp.Body = io.NopCloser(bytes.NewBuffer(w))
-
-			logMap := map[string]string{
-				"originReq": ctx.Value(RequestBodyKey).(string),
-				"kiroReq":   string(body),
-				"kiroResp":  string(w),
-				"err":       err.Error(),
-			}
-
-			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		// 【包3】HTTP 请求失败
+		if s.logger != nil {
+			s.logger.Error(getMsgIdFromCtx(ctx), "【包3】Kiro API请求失败(Tools)", map[string]any{
+				"error": err.Error(),
+			})
 		}
-
 		if !IsNonCircuitBreakingError(err) {
 			s.authManager.RecordRequestResult(accountID, false)
 		}
@@ -1587,32 +1667,46 @@ func (s *ChatService) ChatStreamWithToolsAndUsage(
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		reqErr := fmt.Errorf("请求失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
 
-		// 详细错误日志：记录完整的请求链路数据
-		if IsErrorLog(err) {
-			logMap := map[string]string{
-				"originReq": ctx.Value(RequestBodyKey).(string),
-				"kiroReq":   string(body),
-				"kiroResp":  string(bodyBytes),
-				"err":       err.Error(),
-			}
-
-			log.Printf("[ERROR_LOG] logMap：%s", toJSONString(logMap))
+		// 【包3】Kiro API 返回非200
+		if s.logger != nil {
+			s.logger.Error(getMsgIdFromCtx(ctx), "【包3】Kiro API返回非200(Tools)", map[string]any{
+				"statusCode": resp.StatusCode,
+				"body":       string(bodyBytes),
+			})
 		}
-
 		if !IsNonCircuitBreakingError(reqErr) {
 			s.authManager.RecordRequestResult(accountID, false)
 		}
 		return nil, reqErr
 	}
 
+	// 记录请求成功（headers）
+	if s.logger != nil {
+		headers := make(map[string]string)
+		for k, v := range resp.Header {
+			if len(v) > 0 {
+				headers[k] = v[0]
+			}
+		}
+		DebugLog(ctx, s.logger, "【包3】Kiro API返回成功(Tools)", map[string]any{
+			"statusCode":  resp.StatusCode,
+			"contentType": resp.Header.Get("Content-Type"),
+			"requestId":   resp.Header.Get("x-amzn-RequestId"),
+			"headers":     headers,
+		})
+	}
+
 	s.authManager.RecordRequestResult(accountID, true)
 
-	return s.parseEventStreamWithTools(resp.Body, callback)
+	// 解析 EventStream（每个事件的 payload 在 parseEventStreamWithTools 内逐条记录）
+	usage, parseErr := s.parseEventStreamWithTools(ctx, resp.Body, callback)
+
+	return usage, parseErr
 }
 
 // parseEventStreamWithTools 解析 EventStream（支持工具调用）
 // 返回 KiroUsage 包含从 API 获取的精确 token 使用量
-func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUseCallback) (*KiroUsage, error) {
+func (s *ChatService) parseEventStreamWithTools(ctx context.Context, body io.Reader, callback ToolUseCallback) (*KiroUsage, error) {
 	usage := &KiroUsage{}
 	utf8Buffer := &UTF8Buffer{} // UTF-8 缓冲处理器
 
@@ -1634,21 +1728,41 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 				}
 				// 完成未处理的工具调用
 				if currentToolUse != nil && !processedIds[currentToolUse.ToolUseId] {
-					input, ok := parseToolInput(currentToolUse.InputBuffer)
+					input, ok, truncated := parseToolInput(currentToolUse.InputBuffer)
 					if ok {
 						callback("", &KiroToolUse{
 							ToolUseId: currentToolUse.ToolUseId,
 							Name:      currentToolUse.Name,
 							Input:     input,
+							Truncated: truncated,
 						}, false, false)
 					} else {
 						// 无法解析，发送跳过通知并记录日志
-						callback(fmt.Sprintf("\n\n⚠️ Tool \"%s\" was skipped: input truncated by Kiro API (output token limit exceeded)", currentToolUse.Name), nil, false, false)
+						callback(fmt.Sprintf("\n\n⚠️ Tool \"%s\" was skipped: input truncated by API (output token limit exceeded)", currentToolUse.Name), nil, false, false)
 						logToolSkipped(currentToolUse.Name, currentToolUse.InputBuffer)
 					}
 				}
 				callback("", nil, true, false)
+
+				// 【包3】记录每个 EventStream 事件的原始 payload
+				// 先检查 payload 是否为合法 JSON，是则直接嵌入（避免双重转义），否则用 string 降级
+				if s.logger != nil {
+					DebugLog(ctx, s.logger, "【包3】EventStream事件(Tools)", map[string]any{
+						"eventType": "streamEOF",
+						"payload":   err.Error(),
+					})
+				}
+
 				return usage, nil
+			}
+
+			// 【包3】记录每个 EventStream 事件的原始 payload
+			// 先检查 payload 是否为合法 JSON，是则直接嵌入（避免双重转义），否则用 string 降级
+			if s.logger != nil {
+				DebugLog(ctx, s.logger, "【包3】EventStream事件(Tools)", map[string]any{
+					"eventType": "readError",
+					"payload":   err.Error(),
+				})
 			}
 			return usage, err
 		}
@@ -1663,6 +1777,21 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 		}
 
 		eventType := msg.Headers[":event-type"]
+
+		// 【包3】记录每个 EventStream 事件的原始 payload
+		// 先检查 payload 是否为合法 JSON，是则直接嵌入（避免双重转义），否则用 string 降级
+		if s.logger != nil {
+			var payloadVal any
+			if json.Valid(msg.Payload) {
+				payloadVal = json.RawMessage(msg.Payload)
+			} else {
+				payloadVal = string(msg.Payload)
+			}
+			DebugLog(ctx, s.logger, "【包3】EventStream事件(Tools)", map[string]any{
+				"eventType": eventType,
+				"payload":   payloadVal,
+			})
+		}
 
 		// 解析 assistantResponseEvent（文本内容）
 		if eventType == "assistantResponseEvent" {
@@ -1876,12 +2005,13 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 				// 如果是不同的工具调用，先完成前一个
 				if currentToolUse != nil && currentToolUse.ToolUseId != event.ToolUseId {
 					if !processedIds[currentToolUse.ToolUseId] {
-						input, ok := parseToolInput(currentToolUse.InputBuffer)
+						input, ok, truncated := parseToolInput(currentToolUse.InputBuffer)
 						if ok {
 							callback("", &KiroToolUse{
 								ToolUseId: currentToolUse.ToolUseId,
 								Name:      currentToolUse.Name,
 								Input:     input,
+								Truncated: truncated,
 							}, false, false)
 						} else {
 							// 无法解析，发送跳过通知并记录日志
@@ -1918,12 +2048,13 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 
 			// 工具调用完成
 			if event.Stop && currentToolUse != nil {
-				input, ok := parseToolInput(currentToolUse.InputBuffer)
+				input, ok, truncated := parseToolInput(currentToolUse.InputBuffer)
 				if ok {
 					callback("", &KiroToolUse{
 						ToolUseId: currentToolUse.ToolUseId,
 						Name:      currentToolUse.Name,
 						Input:     input,
+						Truncated: truncated,
 					}, false, false)
 				} else {
 					// 无法解析，发送跳过通知并记录日志
@@ -1944,17 +2075,20 @@ func (s *ChatService) parseEventStreamWithTools(body io.Reader, callback ToolUse
 //
 // 当 ok=false 时，调用方应跳过该工具调用，不再返回包含 _error 和 _partialInput 的错误 map
 // Requirements: 2.4, 3.1, 3.2, 6.1, 6.2, 6.3
-func parseToolInput(buffer string) (map[string]interface{}, bool) {
+// parseToolInput 解析工具调用的 input JSON
+// 返回值：(解析结果, 是否成功, 是否被截断修复)
+// truncated=true 表示 JSON 是被修复过的，语义可能不完整
+func parseToolInput(buffer string) (map[string]interface{}, bool, bool) {
 	// 空字符串返回空 map 和 true（向后兼容）
 	if buffer == "" {
-		return make(map[string]interface{}), true
+		return make(map[string]interface{}), true, false
 	}
 
 	// 尝试标准 JSON 解析
 	var input map[string]interface{}
 	if err := json.Unmarshal([]byte(buffer), &input); err == nil {
-		// 解析成功，返回结果
-		return input, true
+		// 解析成功，原始 JSON 完整
+		return input, true, false
 	}
 
 	// JSON 解析失败，检测是否是截断
@@ -1962,25 +2096,25 @@ func parseToolInput(buffer string) (map[string]interface{}, bool) {
 
 	// 非截断情况（语法错误），无法修复
 	if truncType == TruncationNone {
-		return nil, false
+		return nil, false, false
 	}
 
 	// 尝试修复截断的 JSON
 	fixed, ok := fixTruncatedJSON(buffer, truncType)
 	if !ok {
 		// 修复失败，返回 nil 表示跳过
-		return nil, false
+		return nil, false, false
 	}
 
 	// 修复成功，解析修复后的 JSON
 	var fixedInput map[string]interface{}
 	if err := json.Unmarshal([]byte(fixed), &fixedInput); err != nil {
 		// 修复后仍无法解析，返回 nil 表示跳过
-		return nil, false
+		return nil, false, false
 	}
 
-	// 修复成功，返回修复后的结果
-	return fixedInput, true
+	// 修复成功但标记为截断，让调用方决定如何处理
+	return fixedInput, true, true
 }
 
 // logToolSkipped 记录工具调用被跳过的日志

@@ -1,13 +1,12 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +18,12 @@ import (
 
 	kiroclient "github.com/jinfeijie/kiro-api-client-go"
 )
+
+// errorJSONWithMsgId 返回带 msgId 的错误响应（/v1/* 接口专用）
+// 让前端能看到请求的 msgId，便于排查问题
+func errorJSONWithMsgId(c *gin.Context, code int, errVal any) {
+	c.JSON(code, gin.H{"error": errVal, "msgId": GetMsgID(c)})
+}
 
 // computeHash 计算数据的 MD5 hash（前8位）
 func computeHash(data []byte) string {
@@ -665,11 +670,9 @@ func ipBlacklistMiddleware() gin.HandlerFunc {
 		ipBlacklistMutex.RUnlock()
 
 		if blocked {
-			c.JSON(403, gin.H{
-				"error": map[string]any{
-					"message": "IP blocked",
-					"type":    "forbidden",
-				},
+			errorJSONWithMsgId(c, 403, map[string]any{
+				"message": "IP blocked",
+				"type":    "forbidden",
 			})
 			c.Abort()
 			return
@@ -798,11 +801,9 @@ func rateLimitMiddleware() gin.HandlerFunc {
 			if penalty > 0 {
 				time.Sleep(time.Duration(penalty) * time.Second)
 			}
-			c.JSON(500, gin.H{
-				"error": map[string]any{
-					"message": "Rate limit exceeded",
-					"type":    "rate_limit_error",
-				},
+			errorJSONWithMsgId(c, 429, map[string]any{
+				"message": "Rate limit exceeded",
+				"type":    "rate_limit_error",
 			})
 			c.Abort()
 			return
@@ -929,11 +930,9 @@ func apiKeyAuthMiddleware() gin.HandlerFunc {
 
 		// 验证 API-KEY
 		if apiKey == "" {
-			c.JSON(401, gin.H{
-				"error": map[string]any{
-					"message": "Missing API key",
-					"type":    "authentication_error",
-				},
+			errorJSONWithMsgId(c, 401, map[string]any{
+				"message": "Missing API key",
+				"type":    "authentication_error",
 			})
 			c.Abort()
 			return
@@ -949,11 +948,9 @@ func apiKeyAuthMiddleware() gin.HandlerFunc {
 		}
 
 		if !valid {
-			c.JSON(401, gin.H{
-				"error": map[string]any{
-					"message": "Invalid API key",
-					"type":    "authentication_error",
-				},
+			errorJSONWithMsgId(c, 401, map[string]any{
+				"message": "Invalid API key",
+				"type":    "authentication_error",
 			})
 			c.Abort()
 			return
@@ -1050,6 +1047,11 @@ func main() {
 
 	// 初始化 Kiro 客户端
 	client = kiroclient.NewKiroClient()
+
+	// 注入链路日志到 ChatService（用于记录包2、包3）
+	if logger != nil {
+		client.Chat.SetLogger(logger)
+	}
 
 	// 初始化账号缓存（从文件加载到内存）
 	if err := client.Auth.InitAccountsCache(); err != nil {
@@ -1460,19 +1462,34 @@ func handleToolsCall(c *gin.Context) {
 }
 
 // handleOpenAIChat 处理 OpenAI 格式请求
+// containsDebugKeyword 扫描消息列表，检测是否包含 OneDayAI_Start_Debug 关键字
+// 直接序列化为 JSON 后全文搜索，简单粗暴
+func containsDebugKeyword(messages []map[string]any) bool {
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "OneDayAI_Start_Debug")
+}
+
 func handleOpenAIChat(c *gin.Context) {
 	var req OpenAIChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+		errorJSONWithMsgId(c, 400, err.Error())
 		return
 	}
 
-	// 记录 OpenAI 格式请求输入
+	// 扫描消息，检测 OneDayAI_Start_Debug 关键字，开启 per-request debug 模式
+	if containsDebugKeyword(req.Messages) {
+		ctx := context.WithValue(c.Request.Context(), kiroclient.DebugModeKey, true)
+		c.Request = c.Request.WithContext(ctx)
+	}
+
+	// 【包1】记录客户端原始请求 body
+	// nil 保护：logger 可能未初始化，Go 接口 nil 陷阱会导致 panic
 	if logger != nil {
-		logger.Info(GetMsgID(c), "OpenAI 请求输入", map[string]any{
-			"model":    req.Model,
-			"stream":   req.Stream,
-			"msgCount": len(req.Messages),
+		kiroclient.DebugLog(c.Request.Context(), logger, "【包1】客户端请求", map[string]any{
+			"body": GetRequestBody(c),
 		})
 	}
 
@@ -1483,9 +1500,7 @@ func handleOpenAIChat(c *gin.Context) {
 
 	// 验证模型参数
 	if req.Model != "" && !kiroclient.IsValidModel(req.Model) {
-		c.JSON(400, gin.H{
-			"error": fmt.Sprintf("无效的模型 ID: %s", req.Model),
-		})
+		errorJSONWithMsgId(c, 400, fmt.Sprintf("无效的模型 ID: %s", req.Model))
 		return
 	}
 
@@ -1511,7 +1526,7 @@ type CountTokensRequest struct {
 func handleCountTokens(c *gin.Context) {
 	var req CountTokensRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request body"})
+		errorJSONWithMsgId(c, 400, "Invalid request body")
 		return
 	}
 
@@ -1560,22 +1575,24 @@ func handleCountTokens(c *gin.Context) {
 
 // handleClaudeChat 处理 Claude 格式请求
 func handleClaudeChat(c *gin.Context) {
-	// 调试：记录原始请求体
-	bodyBytes, _ := io.ReadAll(c.Request.Body)
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	if logger != nil {
-		logger.Debug(GetMsgID(c), "Claude 原始请求", map[string]any{
-			"body": string(bodyBytes),
-		})
-	}
-
 	var req ClaudeChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+		errorJSONWithMsgId(c, 400, err.Error())
 		return
 	}
 
-	// Claude 请求输入日志已禁用（减少日志噪音）
+	// 扫描消息，检测 OneDayAI_Start_Debug 关键字，开启 per-request debug 模式
+	if containsDebugKeyword(req.Messages) {
+		ctx := context.WithValue(c.Request.Context(), kiroclient.DebugModeKey, true)
+		c.Request = c.Request.WithContext(ctx)
+	}
+
+	// 【包1】记录客户端原始请求 body
+	if logger != nil {
+		kiroclient.DebugLog(c.Request.Context(), logger, "【包1】客户端请求", map[string]any{
+			"body": GetRequestBody(c),
+		})
+	}
 
 	// 应用模型映射（标准化模型ID）
 	if req.Model != "" {
@@ -1584,9 +1601,7 @@ func handleClaudeChat(c *gin.Context) {
 
 	// 验证模型参数
 	if req.Model != "" && !kiroclient.IsValidModel(req.Model) {
-		c.JSON(400, gin.H{
-			"error": fmt.Sprintf("无效的模型 ID: %s", req.Model),
-		})
+		errorJSONWithMsgId(c, 400, fmt.Sprintf("无效的模型 ID: %s", req.Model))
 		return
 	}
 
@@ -1981,7 +1996,104 @@ func extractToolResultContent(content any) string {
 	return fmt.Sprintf("%v", content)
 }
 
-// handleStreamResponse 处理流式响应
+// validateToolUseInput 校验 tool_use 的 input 是否包含所有 required 字段
+// 根据 tools 定义中的 inputSchema.required 数组检查
+// 返回缺失的字段列表，空列表表示校验通过
+// 为什么需要这个：上游模型可能生成语法合法但缺少必需参数的 tool_use（如 Write 缺少 content）
+// 这种情况 JSON 解析成功、truncated=false，但客户端执行时会报 InputValidationError
+func validateToolUseInput(toolName string, input map[string]any, tools []kiroclient.KiroToolWrapper) []string {
+	// 找到对应工具的定义
+	var schema map[string]any
+	for _, t := range tools {
+		if t.ToolSpecification.Name == toolName {
+			schema = t.ToolSpecification.InputSchema
+			break
+		}
+	}
+	if schema == nil {
+		// 没找到工具定义，跳过校验（不阻断）
+		return nil
+	}
+
+	// 提取 required 数组
+	reqRaw, ok := schema["required"]
+	if !ok {
+		return nil
+	}
+	reqSlice, ok := reqRaw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	// 逐个检查 required 字段是否存在于 input 中
+	var missing []string
+	for _, r := range reqSlice {
+		fieldName, ok := r.(string)
+		if !ok {
+			continue
+		}
+		if _, exists := input[fieldName]; !exists {
+			missing = append(missing, fieldName)
+		}
+	}
+	return missing
+}
+
+// patchMissingFields 根据工具 schema 的 properties 定义，为缺失字段补上类型默认值
+// string→"", number/integer→0, boolean→false, array→[], object→{}
+func patchMissingFields(input map[string]any, missingFields []string, tools []kiroclient.KiroToolWrapper, toolName string) {
+	// 找到工具的 properties 定义
+	var props map[string]any
+	for _, t := range tools {
+		if t.ToolSpecification.Name != toolName {
+			continue
+		}
+		schema := t.ToolSpecification.InputSchema
+		if schema == nil {
+			return
+		}
+		raw, ok := schema["properties"]
+		if !ok {
+			return
+		}
+		props, _ = raw.(map[string]any)
+		break
+	}
+	if props == nil {
+		return
+	}
+
+	for _, field := range missingFields {
+		propDef, ok := props[field]
+		if !ok {
+			// schema 里没定义这个字段，补空字符串兜底
+			input[field] = ""
+			continue
+		}
+		propMap, ok := propDef.(map[string]any)
+		if !ok {
+			input[field] = ""
+			continue
+		}
+		// 根据 type 字段决定默认值
+		fieldType, _ := propMap["type"].(string)
+		switch fieldType {
+		case "string":
+			input[field] = fmt.Sprintf("「模型未知原因导致字段: %s 缺失，建议重试。注意添加提示词：`分段写入，减少失败。` 」", field)
+		case "number", "integer":
+			input[field] = 0
+		case "boolean":
+			input[field] = false
+		case "array":
+			input[field] = []any{}
+		case "object":
+			input[field] = map[string]any{}
+		default:
+			input[field] = ""
+		}
+	}
+}
+
 // handleStreamResponse 处理流式响应
 // 使用 ChatStreamWithModelAndUsage 获取 Kiro API 返回的精确 token 使用量
 func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, format string, model string) {
@@ -1995,7 +2107,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		if logger != nil {
 			RecordErrorFromGin(c, logger, err, "")
 		}
-		c.JSON(500, gin.H{"error": "Streaming not supported"})
+		errorJSONWithMsgId(c, 500, "Streaming not supported")
 		return
 	}
 
@@ -2191,7 +2303,12 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		// 累加全局统计（使用精确值）
 		addTokenStats(inputTokens, outputTokens)
 
-		// 流式响应完成日志已禁用（减少日志噪音）
+		// 【包4】记录返回给客户端的响应内容
+		if logger != nil {
+			kiroclient.DebugLog(c.Request.Context(), logger, "【包4】返回客户端", map[string]any{
+				"body": outputBuilder.String(),
+			})
+		}
 	}
 }
 
@@ -2227,7 +2344,7 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 				"accountId": accountID,
 			})
 		}
-		c.JSON(500, gin.H{"error": err.Error()})
+		errorJSONWithMsgId(c, 500, err.Error())
 		return
 	}
 
@@ -2253,7 +2370,12 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 		reasoningTokens = usage.ReasoningTokens
 	}
 
-	// 非流式响应完成日志已禁用（减少日志噪音）
+	// 【包4】记录返回给客户端的响应内容
+	if logger != nil {
+		kiroclient.DebugLog(c.Request.Context(), logger, "【包4】返回客户端", map[string]any{
+			"body": response,
+		})
+	}
 
 	if format == "openai" {
 		// OpenAI 格式响应（完整版，对齐 new-api）
@@ -2337,7 +2459,7 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 		if logger != nil {
 			RecordErrorFromGin(c, logger, err, "")
 		}
-		c.JSON(500, gin.H{"error": "Streaming not supported"})
+		errorJSONWithMsgId(c, 500, "Streaming not supported")
 		return
 	}
 
@@ -2346,7 +2468,8 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 	var outputBuilder strings.Builder
 	msgID := generateID("msg")
 	contentBlockIndex := 0
-	hasToolUse := false // 是否真的有工具调用，用于判断 stop_reason
+	hasToolUse := false          // 是否真的有工具调用，用于判断 stop_reason
+	hasTruncatedToolUse := false // 是否有被截断的工具调用，用于设置 stop_reason 为 max_tokens
 
 	// Claude 格式：发送 message_start 事件（使用估算值）
 	if format == "claude" {
@@ -2450,8 +2573,11 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			// 发送 message_delta 事件
 			// 只有真正有工具调用时才返回 tool_use，而不是根据 contentBlockIndex 判断
 			// contentBlockIndex 在文本块开始时就会递增，不能用来判断是否有工具调用
+			// 如果有截断的 tool_use，返回 max_tokens 让客户端知道输出不完整
 			stopReason := "end_turn"
-			if hasToolUse {
+			if hasTruncatedToolUse {
+				stopReason = "max_tokens"
+			} else if hasToolUse {
 				stopReason = "tool_use"
 			}
 			msgDelta := map[string]any{
@@ -2500,6 +2626,30 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 
 		// 处理工具调用
 		if toolUse != nil {
+			// 截断的 tool_use 不发送给客户端，标记后让 stop_reason 变为 max_tokens
+			if toolUse.Truncated {
+				hasTruncatedToolUse = true
+				if logger != nil {
+					logger.Warn(GetMsgID(c), "tool_use input 被截断，不发送给客户端", map[string]any{
+						"toolName":  toolUse.Name,
+						"toolUseId": toolUse.ToolUseId,
+					})
+				}
+				return
+			}
+
+			// 校验 required 字段是否齐全，缺 content 则补空字符串放行
+			if missingFields := validateToolUseInput(toolUse.Name, toolUse.Input, tools); len(missingFields) > 0 {
+				patchMissingFields(toolUse.Input, missingFields, tools, toolUse.Name)
+				if logger != nil {
+					logger.Warn(GetMsgID(c), "tool_use 缺少必填参数，已补齐 content", map[string]any{
+						"toolName":      toolUse.Name,
+						"toolUseId":     toolUse.ToolUseId,
+						"missingFields": missingFields,
+					})
+				}
+			}
+
 			hasToolUse = true // 标记确实有工具调用
 			// 刷新 thinking 处理器缓冲区
 			thinkingProcessor.Flush()
@@ -2593,7 +2743,12 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 		// 累加全局统计（使用精确值）
 		addTokenStats(inputTokens, outputTokens)
 
-		// 流式响应(Tools)完成日志已禁用（减少日志噪音）
+		// 【包4】记录返回给客户端的响应内容
+		if logger != nil {
+			kiroclient.DebugLog(c.Request.Context(), logger, "【包4】返回客户端(Tools)", map[string]any{
+				"body": outputBuilder.String(),
+			})
+		}
 	}
 }
 
@@ -2632,7 +2787,7 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 				"accountId":  accountID,
 			})
 		}
-		c.JSON(500, gin.H{"error": err.Error()})
+		errorJSONWithMsgId(c, 500, err.Error())
 		return
 	}
 
@@ -2660,8 +2815,31 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 		})
 	}
 
-	// 添加工具调用块
+	// 添加工具调用块（过滤掉截断的和缺少必填参数的 tool_use）
+	hasTruncated := false
 	for _, tu := range toolUses {
+		// 截断的 tool_use 不发送给客户端
+		if tu.Truncated {
+			hasTruncated = true
+			if logger != nil {
+				logger.Warn(GetMsgID(c), "tool_use input 被截断，不发送给客户端", map[string]any{
+					"toolName":  tu.Name,
+					"toolUseId": tu.ToolUseId,
+				})
+			}
+			continue
+		}
+		// 校验 required 字段是否齐全，缺 content 则补空字符串放行
+		if missingFields := validateToolUseInput(tu.Name, tu.Input, tools); len(missingFields) > 0 {
+			patchMissingFields(tu.Input, missingFields, tools, tu.Name)
+			if logger != nil {
+				logger.Warn(GetMsgID(c), "tool_use 缺少必填参数，已补齐 content", map[string]any{
+					"toolName":      tu.Name,
+					"toolUseId":     tu.ToolUseId,
+					"missingFields": missingFields,
+				})
+			}
+		}
 		// 恢复原始工具名（如果有映射）
 		toolName := tu.Name
 		if originalName, ok := toolNameMap[tu.Name]; ok {
@@ -2676,8 +2854,11 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	}
 
 	// 确定 stop_reason
+	// 如果有截断的 tool_use，返回 max_tokens 让客户端知道输出不完整
 	stopReason := "end_turn"
-	if len(toolUses) > 0 {
+	if hasTruncated {
+		stopReason = "max_tokens"
+	} else if len(toolUses) > 0 {
 		stopReason = "tool_use"
 	}
 
@@ -2692,6 +2873,14 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 			"input_tokens":  inputTokens,
 			"output_tokens": outputTokens,
 		},
+	}
+
+	// 【包4】记录返回给客户端的响应内容
+	if logger != nil {
+		respJSON, _ := json.Marshal(resp)
+		kiroclient.DebugLog(c.Request.Context(), logger, "【包4】返回客户端(Tools)", map[string]any{
+			"body": string(respJSON),
+		})
 	}
 
 	// 累加全局统计（使用精确值）

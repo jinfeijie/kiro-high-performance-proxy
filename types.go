@@ -568,6 +568,7 @@ type KiroToolUse struct {
 	ToolUseId string                 `json:"toolUseId"`
 	Name      string                 `json:"name"`
 	Input     map[string]interface{} `json:"input"`
+	Truncated bool                   `json:"-"` // 标记 input 是否被截断后修复的，不序列化到 JSON
 }
 
 // KiroUserInputMessageContext 用户输入消息上下文

@@ -1,17 +1,16 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
-	"sync"
-	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // ========== 日志级别定义 ==========
 
-// LogLevel 日志级别
+// LogLevel 日志级别（保持对外接口兼容）
 type LogLevel int
 
 const (
@@ -40,9 +39,9 @@ func (l LogLevel) String() string {
 	}
 }
 
-// ========== 日志条目定义 ==========
+// ========== 日志条目定义（保持兼容，用于查询接口） ==========
 
-// LogEntry 日志条目
+// LogEntry 日志条目（保持兼容性，QueryByMsgID 等接口使用）
 type LogEntry struct {
 	Timestamp string         `json:"timestamp"`
 	Level     string         `json:"level"`
@@ -51,14 +50,15 @@ type LogEntry struct {
 	Data      map[string]any `json:"data,omitempty"`
 }
 
-// ========== 结构化日志记录器 ==========
+// ========== 结构化日志记录器（基于 zap） ==========
 
 // StructuredLogger 结构化日志记录器
-// 遵循 C 语言哲学：简单直接、数据结构透明、最小依赖
-// 直接输出到 stdout，不写文件
+// 内部使用 uber-go/zap，对外保持原有接口不变
+// zap.AddCaller() 自动记录调用者文件名和行号
 type StructuredLogger struct {
-	mutex sync.Mutex
-	level LogLevel // 最低日志级别
+	zap         *zap.Logger
+	level       zap.AtomicLevel // 动态日志级别（控制正常日志）
+	forceLogger *zap.Logger     // 独立 logger，固定 Debug 级别，ForceDebug 专用，不影响全局
 }
 
 // 默认配置常量
@@ -80,95 +80,149 @@ func ParseLogLevel(s string) LogLevel {
 	case "NONE", "OFF":
 		return NONE
 	default:
-		return INFO // 默认 INFO
+		return INFO
 	}
 }
 
-// GetLevel 获取当前日志级别
-func (l *StructuredLogger) GetLevel() LogLevel {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-	return l.level
+// toZapLevel 将自定义 LogLevel 转为 zapcore.Level
+func toZapLevel(l LogLevel) zapcore.Level {
+	switch l {
+	case DEBUG:
+		return zapcore.DebugLevel
+	case INFO:
+		return zapcore.InfoLevel
+	case WARN:
+		return zapcore.WarnLevel
+	case ERROR:
+		return zapcore.ErrorLevel
+	case NONE:
+		// zap 没有 NONE，用 FatalLevel+1 使所有日志都被过滤
+		return zapcore.FatalLevel + 1
+	default:
+		return zapcore.InfoLevel
+	}
 }
 
 // NewStructuredLogger 创建日志记录器
 // 参数已废弃，保留签名兼容性
 func NewStructuredLogger(filePath string, maxSize int64) (*StructuredLogger, error) {
-	logger := &StructuredLogger{
-		level: DefaultLogLevel,
-	}
-
-	// 从环境变量读取日志级别（优先级最高）
+	// 确定初始日志级别
+	initLevel := DefaultLogLevel
 	if envLevel := os.Getenv("LOG_LEVEL"); envLevel != "" {
-		logger.level = ParseLogLevel(envLevel)
+		initLevel = ParseLogLevel(envLevel)
 	}
 
-	return logger, nil
+	// 创建动态级别控制器
+	atomicLevel := zap.NewAtomicLevelAt(toZapLevel(initLevel))
+
+	// 自定义 encoder 配置：JSON 格式，带 caller 信息
+	encoderCfg := zapcore.EncoderConfig{
+		TimeKey:      "timestamp",
+		LevelKey:     "level",
+		CallerKey:    "caller",
+		MessageKey:   "message",
+		EncodeTime:   zapcore.ISO8601TimeEncoder,
+		EncodeLevel:  zapcore.CapitalLevelEncoder,
+		EncodeCaller: zapcore.ShortCallerEncoder,
+	}
+
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderCfg),
+		zapcore.AddSync(os.Stdout),
+		atomicLevel,
+	)
+
+	// AddCaller: 自动记录调用者文件名和行号
+	// AddCallerSkip(1): 跳过 StructuredLogger 自身的包装层
+	zapLogger := zap.New(core,
+		zap.AddCaller(),
+		zap.AddCallerSkip(1),
+	)
+
+	// 创建独立的 forceLogger，固定 Debug 级别
+	// ForceDebug 专用，避免修改全局 level 导致并发竞态
+	forceCore := zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderCfg),
+		zapcore.AddSync(os.Stdout),
+		zapcore.DebugLevel,
+	)
+	forceLogger := zap.New(forceCore,
+		zap.AddCaller(),
+		zap.AddCallerSkip(1),
+	)
+
+	return &StructuredLogger{
+		zap:         zapLogger,
+		level:       atomicLevel,
+		forceLogger: forceLogger,
+	}, nil
 }
 
-// SetLevel 设置最低日志级别
+// GetLevel 获取当前日志级别
+func (l *StructuredLogger) GetLevel() LogLevel {
+	zapLvl := l.level.Level()
+	switch {
+	case zapLvl <= zapcore.DebugLevel:
+		return DEBUG
+	case zapLvl == zapcore.InfoLevel:
+		return INFO
+	case zapLvl == zapcore.WarnLevel:
+		return WARN
+	case zapLvl == zapcore.ErrorLevel:
+		return ERROR
+	default:
+		return NONE
+	}
+}
+
+// SetLevel 动态设置日志级别
 func (l *StructuredLogger) SetLevel(level LogLevel) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-	l.level = level
+	l.level.SetLevel(toZapLevel(level))
 }
 
-// Log 记录日志（输出到 stdout）
-// level: 日志级别
-// msgID: 请求唯一标识（用于串联追踪）
-// message: 日志消息
-// data: 附加数据（可选）
-func (l *StructuredLogger) Log(level LogLevel, msgID, message string, data map[string]any) {
-	// 级别过滤
-	if level < l.level {
-		return
+// buildFields 将 msgID + data map 转为 zap.Field 切片
+// 保持扁平化：msgId 作为顶层字段，data 中每个 key 也作为顶层字段
+func buildFields(msgID string, data map[string]any) []zap.Field {
+	fields := make([]zap.Field, 0, len(data)+1)
+	fields = append(fields, zap.String("msgId", msgID))
+	for k, v := range data {
+		fields = append(fields, zap.Any(k, v))
 	}
-
-	// 构建日志条目
-	entry := LogEntry{
-		Timestamp: time.Now().Format(time.RFC3339),
-		Level:     level.String(),
-		MsgID:     msgID,
-		Message:   message,
-		Data:      data,
-	}
-
-	// 序列化为 JSON
-	jsonBytes, err := json.Marshal(entry)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[LOG ERROR] JSON序列化失败: %v\n", err)
-		return
-	}
-
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
-	// 输出到 stdout
-	fmt.Println(string(jsonBytes))
+	return fields
 }
 
 // Debug 记录 DEBUG 级别日志
 func (l *StructuredLogger) Debug(msgID, message string, data map[string]any) {
-	l.Log(DEBUG, msgID, message, data)
+	l.zap.Debug(message, buildFields(msgID, data)...)
 }
 
 // Info 记录 INFO 级别日志
 func (l *StructuredLogger) Info(msgID, message string, data map[string]any) {
-	l.Log(INFO, msgID, message, data)
+	l.zap.Info(message, buildFields(msgID, data)...)
 }
 
 // Warn 记录 WARN 级别日志
 func (l *StructuredLogger) Warn(msgID, message string, data map[string]any) {
-	l.Log(WARN, msgID, message, data)
+	l.zap.Warn(message, buildFields(msgID, data)...)
 }
 
 // Error 记录 ERROR 级别日志
 func (l *StructuredLogger) Error(msgID, message string, data map[string]any) {
-	l.Log(ERROR, msgID, message, data)
+	l.zap.Error(message, buildFields(msgID, data)...)
 }
 
-// Close 关闭日志（无操作，保留接口兼容性）
+// ForceDebug 强制输出 DEBUG 日志，无视当前日志级别
+// 用于 OneDayAI_Start_Debug 模式，即使 level=NONE 也能输出
+// 使用独立的 forceLogger，不修改全局 level，避免并发竞态
+func (l *StructuredLogger) ForceDebug(msgID, message string, data map[string]any) {
+	l.forceLogger.Debug(message, buildFields(msgID, data)...)
+}
+
+// Close 关闭日志（刷新 zap 缓冲区）
 func (l *StructuredLogger) Close() error {
+	// Sync 刷新所有缓冲的日志条目
+	// stdout 的 Sync 在某些系统上会返回 error，忽略即可
+	_ = l.zap.Sync()
 	return nil
 }
 
