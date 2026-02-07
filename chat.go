@@ -661,17 +661,31 @@ func generateConversationID() string {
 }
 
 // IsNonCircuitBreakingError 判断错误是否不应触发熔断和降级
-// 以下错误属于客户端问题或超时，不应计入熔断器失败计数：
-// 1. context deadline exceeded - 客户端超时，不是服务端故障
-// 2. Improperly formed request - 请求格式错误，客户端问题
-// 3. Input is too long / CONTENT_LENGTH_EXCEEDS_THRESHOLD - 输入过长，客户端问题
-// 4. INVALID_MODEL_ID - 模型ID无效，客户端传参问题
+// 以下错误不应计入熔断器失败计数：
+// A. 客户端问题：
+//  1. context deadline exceeded - 客户端超时
+//  2. context canceled - 客户端取消请求
+//  3. Improperly formed request - 请求格式错误
+//  4. Input is too long / CONTENT_LENGTH_EXCEEDS_THRESHOLD - 输入过长
+//  5. INVALID_MODEL_ID - 模型ID无效
+//
+// B. 服务端临时故障（非账号问题）：
+//  6. MODEL_TEMPORARILY_UNAVAILABLE - Kiro 模型临时不可用
+//  7. INSUFFICIENT_MODEL_CAPACITY - 模型容量不足（429）
+//  8. service temporarily unavailable - 服务临时不可用（503）
+//  9. 502 Bad Gateway - 网关错误
+//  10. unexpected error - 服务端未捕获异常
 func IsNonCircuitBreakingError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
+
+	// A. 客户端问题
 	if strings.Contains(msg, "context deadline exceeded") {
+		return true
+	}
+	if strings.Contains(msg, "context canceled") {
 		return true
 	}
 	if strings.Contains(msg, "Improperly formed request") {
@@ -683,10 +697,27 @@ func IsNonCircuitBreakingError(err error) bool {
 	if strings.Contains(msg, "Input is too long") {
 		return true
 	}
-	// 模型ID无效属于客户端传参错误，不应触发熔断
 	if strings.Contains(msg, "INVALID_MODEL_ID") {
 		return true
 	}
+
+	// B. 服务端临时故障（非账号问题，重试其他账号也可能遇到）
+	if strings.Contains(msg, "MODEL_TEMPORARILY_UNAVAILABLE") {
+		return true
+	}
+	if strings.Contains(msg, "INSUFFICIENT_MODEL_CAPACITY") {
+		return true
+	}
+	if strings.Contains(msg, "service temporarily unavailable") {
+		return true
+	}
+	if strings.Contains(msg, "502 Bad Gateway") {
+		return true
+	}
+	if strings.Contains(msg, "unexpected error") {
+		return true
+	}
+
 	return false
 }
 
