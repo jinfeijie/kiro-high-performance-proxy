@@ -20,6 +20,7 @@ import (
 // - 错误率 = 失败数 / 总请求数
 func TestConcurrentRecord(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "concurrent-record-test"
 
 	// 并发参数
@@ -68,6 +69,7 @@ func TestConcurrentRecord(t *testing.T) {
 // 验证读取操作不会 panic 或返回异常数据（如负数、NaN）。
 func TestConcurrentGetErrorRate(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "concurrent-read-test"
 
 	// 预先写入一些数据
@@ -148,6 +150,7 @@ func TestConcurrentGetErrorRate(t *testing.T) {
 // - 不会出现数据串扰
 func TestConcurrentMultiAccount(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 
 	numAccounts := 5
 	recordsPerAccount := 200
@@ -198,6 +201,7 @@ func TestConcurrentMultiAccount(t *testing.T) {
 // 在持续写入和读取的同时，触发清理操作，验证不会出现 panic 或数据损坏。
 func TestConcurrentCleanup(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "cleanup-test"
 
 	// 预先写入一些数据

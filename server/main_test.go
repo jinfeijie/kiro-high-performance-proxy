@@ -333,6 +333,10 @@ func TestContentTypeConsistency(t *testing.T) {
 // setupCircuitBreakerTestRouter 创建测试用的 gin 路由器和初始化全局状态
 // 为什么单独封装：避免每个测试重复初始化全局变量，保持测试独立性
 func setupCircuitBreakerTestRouter(accountIDs ...string) *gin.Engine {
+	// 关闭旧的 circuitStats，防止 goroutine 泄漏
+	if circuitStats != nil {
+		circuitStats.Close()
+	}
 	// 初始化全局 circuitStats
 	circuitStats = NewCircuitStats()
 

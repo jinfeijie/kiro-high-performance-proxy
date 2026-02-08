@@ -29,6 +29,7 @@ func TestProperty1_RecordGetErrorRate_RoundTrip(t *testing.T) {
 		}
 
 		cs := NewCircuitStats()
+		defer cs.Close()
 		accountID := "prop1-test-account"
 
 		// 记录 s 次成功
@@ -76,6 +77,7 @@ func TestProperty2_BucketCountInvariant(t *testing.T) {
 		recordCount := int(recordCountRaw%1000) + 1
 
 		cs := NewCircuitStats()
+		defer cs.Close()
 		accountID := "prop2-test-account"
 
 		// 随机记录成功或失败
@@ -137,6 +139,7 @@ func TestProperty2_BucketCountInvariant(t *testing.T) {
 // 满足需求 1.4：没有任何请求记录时返回错误率为0且总请求数为0
 func TestGetErrorRate_EmptyAccount(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 
 	errorRate, totalReqs := cs.GetErrorRate("nonexistent-account", 5)
 
@@ -152,6 +155,7 @@ func TestGetErrorRate_EmptyAccount(t *testing.T) {
 // 验证在单个时间桶内的精确错误率计算
 func TestGetErrorRate_SingleBucket(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "single-bucket-test"
 
 	// 记录 7 次成功、3 次失败 -> 错误率 = 3/10 = 0.3
@@ -178,6 +182,7 @@ func TestGetErrorRate_SingleBucket(t *testing.T) {
 // 验证只有在指定时间窗口内的桶才被计入统计
 func TestGetErrorRate_MultiBucket_WindowFilter(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "multi-bucket-test"
 
 	// 手动构造桶数据，模拟不同时间段的请求
@@ -241,6 +246,7 @@ func TestGetErrorRate_MultiBucket_WindowFilter(t *testing.T) {
 // TestRecord_CreatesBucket 验证 Record 能正确创建新桶
 func TestRecord_CreatesBucket(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "create-bucket-test"
 
 	cs.Record(accountID, true)
@@ -299,6 +305,7 @@ func TestAlignToBucket(t *testing.T) {
 // TestCleanupAccount_RemovesExpiredBuckets 验证过期桶清理
 func TestCleanupAccount_RemovesExpiredBuckets(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "cleanup-test"
 
 	cs.mu.Lock()
@@ -338,6 +345,7 @@ func TestCleanupAccount_RemovesExpiredBuckets(t *testing.T) {
 // TestGetErrorRate_AllFailures 全部失败时错误率为1.0
 func TestGetErrorRate_AllFailures(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "all-failures"
 
 	for i := 0; i < 10; i++ {
@@ -357,6 +365,7 @@ func TestGetErrorRate_AllFailures(t *testing.T) {
 // TestGetErrorRate_AllSuccess 全部成功时错误率为0
 func TestGetErrorRate_AllSuccess(t *testing.T) {
 	cs := NewCircuitStats()
+	defer cs.Close()
 	accountID := "all-success"
 
 	for i := 0; i < 10; i++ {

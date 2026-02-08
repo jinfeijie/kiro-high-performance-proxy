@@ -99,9 +99,11 @@ type ClaudeChatResponse struct {
 }
 
 // ClaudeContentBlock Claude 响应的内容块
+// thinking 类型用 Thinking 字段，text 类型用 Text 字段
 type ClaudeContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
 }
 
 // Token 配置请求
@@ -2121,6 +2123,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 	var estimatedOutputTokens int
 
 	// Claude 格式：先发送 message_start 事件（使用估算值）
+	// 注意：不再提前发 content_block_start，因为可能先来 thinking block
 	if format == "claude" {
 		msgStart := map[string]any{
 			"type": "message_start",
@@ -2137,24 +2140,147 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		}
 		data, _ := json.Marshal(msgStart)
 		_, _ = fmt.Fprintf(c.Writer, "event: message_start\ndata: %s\n\n", string(data))
-
-		// 发送 content_block_start 事件
-		blockStart := map[string]any{
-			"type":  "content_block_start",
-			"index": 0,
-			"content_block": map[string]any{
-				"type": "text",
-				"text": "",
-			},
-		}
-		data, _ = json.Marshal(blockStart)
-		_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
 		flusher.Flush()
 	}
+
+	// Claude 格式的 content block 状态管理
+	// 用于跟踪当前打开的 block 类型，实现 thinking/text block 切换
+	claudeBlockIndex := 0       // 当前 block index
+	claudeBlockType := ""       // 当前打开的 block 类型："thinking" 或 "text" 或 ""（未开）
+	claudeBlockStarted := false // 是否有 block 已开启
+
+	// claudeCloseCurrentBlock 关闭当前打开的 Claude content block
+	claudeCloseCurrentBlock := func() {
+		if !claudeBlockStarted {
+			return
+		}
+		blockStop := map[string]any{
+			"type":  "content_block_stop",
+			"index": claudeBlockIndex,
+		}
+		data, _ := json.Marshal(blockStop)
+		_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+		claudeBlockStarted = false
+		claudeBlockIndex++
+	}
+
+	// claudeEnsureBlock 确保当前打开的 block 类型正确，不对则切换
+	claudeEnsureBlock := func(blockType string) {
+		if claudeBlockStarted && claudeBlockType == blockType {
+			return // 已经是正确类型
+		}
+		// 关闭旧 block
+		claudeCloseCurrentBlock()
+		// 开新 block
+		var contentBlock map[string]any
+		if blockType == "thinking" {
+			contentBlock = map[string]any{"type": "thinking", "thinking": ""}
+		} else {
+			contentBlock = map[string]any{"type": "text", "text": ""}
+		}
+		blockStart := map[string]any{
+			"type":          "content_block_start",
+			"index":         claudeBlockIndex,
+			"content_block": contentBlock,
+		}
+		data, _ := json.Marshal(blockStart)
+		_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+		claudeBlockStarted = true
+		claudeBlockType = blockType
+		flusher.Flush()
+	}
+
+	// 创建 thinking 文本处理器
+	// 检测普通文本中的 <thinking> 标签并根据配置转换输出格式
+	thinkingProcessor := kiroclient.NewThinkingTextProcessor(proxyConfig.ThinkingOutputFormat, func(text string, isThinking bool) {
+		if text == "" {
+			return
+		}
+
+		outputBuilder.WriteString(text)
+
+		if format == "openai" {
+			// OpenAI SSE 格式
+			if isThinking && proxyConfig.ThinkingOutputFormat == kiroclient.ThinkingFormatReasoningContent {
+				chunk := map[string]any{
+					"id":                 chatcmplID,
+					"object":             "chat.completion.chunk",
+					"created":            time.Now().Unix(),
+					"model":              model,
+					"system_fingerprint": nil,
+					"choices": []map[string]any{
+						{
+							"index": 0,
+							"delta": map[string]any{
+								"reasoning_content": text,
+							},
+							"logprobs":      nil,
+							"finish_reason": nil,
+						},
+					},
+				}
+				data, _ := json.Marshal(chunk)
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
+			} else {
+				chunk := map[string]any{
+					"id":                 chatcmplID,
+					"object":             "chat.completion.chunk",
+					"created":            time.Now().Unix(),
+					"model":              model,
+					"system_fingerprint": nil,
+					"choices": []map[string]any{
+						{
+							"index": 0,
+							"delta": map[string]any{
+								"content": text,
+							},
+							"logprobs":      nil,
+							"finish_reason": nil,
+						},
+					},
+				}
+				data, _ := json.Marshal(chunk)
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
+			}
+		} else {
+			// Claude SSE 格式：使用标准 thinking/text content block
+			if isThinking && proxyConfig.ThinkingOutputFormat == kiroclient.ThinkingFormatReasoningContent {
+				// 确保 thinking block 已打开
+				claudeEnsureBlock("thinking")
+				chunk := map[string]any{
+					"type":  "content_block_delta",
+					"index": claudeBlockIndex,
+					"delta": map[string]any{
+						"type":     "thinking_delta",
+						"thinking": text,
+					},
+				}
+				data, _ := json.Marshal(chunk)
+				_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			} else {
+				// 确保 text block 已打开
+				claudeEnsureBlock("text")
+				chunk := map[string]any{
+					"type":  "content_block_delta",
+					"index": claudeBlockIndex,
+					"delta": map[string]string{
+						"type": "text_delta",
+						"text": text,
+					},
+				}
+				data, _ := json.Marshal(chunk)
+				_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
+			}
+		}
+		flusher.Flush()
+	})
 
 	// 使用 ChatStreamWithModelAndUsage 获取精确 usage
 	usage, err := client.Chat.ChatStreamWithModelAndUsage(c.Request.Context(), messages, model, func(content string, done bool) {
 		if done {
+			// 刷新 thinking 处理器缓冲区（与 handleStreamResponseWithTools 对齐）
+			thinkingProcessor.Flush()
+
 			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
 			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
@@ -2196,13 +2322,8 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
 				_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 			} else {
-				// Claude 流式结束：发送 content_block_stop
-				blockStop := map[string]any{
-					"type":  "content_block_stop",
-					"index": 0,
-				}
-				data, _ := json.Marshal(blockStop)
-				_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+				// Claude 流式结束：关闭当前打开的 content block（可能是 thinking 或 text）
+				claudeCloseCurrentBlock()
 
 				// 发送 message_delta 事件（使用估算值）
 				msgDelta := map[string]any{
@@ -2215,7 +2336,7 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 						"output_tokens": estimatedOutputTokens,
 					},
 				}
-				data, _ = json.Marshal(msgDelta)
+				data, _ := json.Marshal(msgDelta)
 				_, _ = fmt.Fprintf(c.Writer, "event: message_delta\ndata: %s\n\n", string(data))
 
 				// 发送 message_stop 事件
@@ -2229,45 +2350,9 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 			return
 		}
 
-		// 累积输出内容用于计算 token
-		outputBuilder.WriteString(content)
-
-		if format == "openai" {
-			// OpenAI SSE 格式（finish_reason 在非结束 chunk 中为 null）
-			chunk := map[string]any{
-				"id":                 chatcmplID,
-				"object":             "chat.completion.chunk",
-				"created":            time.Now().Unix(),
-				"model":              model,
-				"system_fingerprint": nil,
-				"choices": []map[string]any{
-					{
-						"index": 0,
-						"delta": map[string]any{
-							"content": content,
-						},
-						"logprobs":      nil,
-						"finish_reason": nil,
-					},
-				},
-			}
-			data, _ := json.Marshal(chunk)
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(data))
-		} else {
-			// Claude SSE 格式：content_block_delta
-			chunk := map[string]any{
-				"type":  "content_block_delta",
-				"index": 0,
-				"delta": map[string]string{
-					"type": "text_delta",
-					"text": content,
-				},
-			}
-			data, _ := json.Marshal(chunk)
-			_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
-		}
-
-		flusher.Flush()
+		// 通过 ThinkingTextProcessor 处理文本（检测 <thinking> 标签）
+		// 与 handleStreamResponseWithTools 对齐
+		thinkingProcessor.ProcessText(content, false)
 	})
 
 	if err != nil {
@@ -2276,8 +2361,9 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 		if !kiroclient.IsNonCircuitBreakingError(err) {
 			recordAccountRequest(accountID, email, 500, err.Error())
 		}
-		// 记录流式响应错误
+		// 记录流式响应错误（与非流式对齐，记录完整错误上下文）
 		if logger != nil {
+			RecordErrorFromGin(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "流式响应失败", map[string]any{
 				"format":    format,
 				"model":     model,
@@ -2320,14 +2406,31 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	// 本地估算的 inputTokens（降级使用）
 	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 
-	// 收集完整响应
+	// 分离 thinking 和 text 内容（与流式对齐）
 	var responseBuilder strings.Builder
+	var thinkingBuilder strings.Builder
+
+	thinkingProcessor := kiroclient.NewThinkingTextProcessor(proxyConfig.ThinkingOutputFormat, func(text string, isThinking bool) {
+		if text == "" {
+			return
+		}
+		if isThinking && proxyConfig.ThinkingOutputFormat == kiroclient.ThinkingFormatReasoningContent {
+			// reasoning_content 格式：thinking 内容单独存储
+			thinkingBuilder.WriteString(text)
+		} else {
+			// 普通文本或已转换的 <thinking>/<think> 标签
+			responseBuilder.WriteString(text)
+		}
+	})
 
 	// 使用 ChatStreamWithModelAndUsage 获取精确 usage
 	usage, err := client.Chat.ChatStreamWithModelAndUsage(c.Request.Context(), messages, model, func(content string, done bool) {
-		if !done {
-			responseBuilder.WriteString(content)
+		if done {
+			thinkingProcessor.Flush()
+			return
 		}
+		// 通过 ThinkingTextProcessor 处理文本（检测 <thinking> 标签）
+		thinkingProcessor.ProcessText(content, false)
 	})
 
 	if err != nil {
@@ -2350,16 +2453,15 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	}
 
 	response := responseBuilder.String()
+	thinkingContent := thinkingBuilder.String()
 
 	// 记录账号请求成功
 	accountID, email := client.Auth.GetLastSelectedAccountInfo()
 	recordAccountRequest(accountID, email, 200, "")
 
 	// 使用精确 usage（如果可用且有效），否则降级使用估算值
-	// 注意：usage 可能非 nil 但 InputTokens 为 0（Kiro API 未返回有效 usage）
-	// 此时应降级使用本地估算值，而不是覆盖为 0
 	inputTokens := estimatedInputTokens
-	outputTokens := kiroclient.CountTokens(response)
+	outputTokens := kiroclient.CountTokens(response + thinkingContent)
 	cacheReadTokens := 0
 	cacheWriteTokens := 0
 	reasoningTokens := 0
@@ -2374,13 +2476,18 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 	// 【包4】记录返回给客户端的响应内容
 	if logger != nil {
 		kiroclient.DebugLog(c.Request.Context(), logger, "【包4】返回客户端", map[string]any{
-			"body": response,
+			"body":     response,
+			"thinking": thinkingContent,
 		})
 	}
 
 	if format == "openai" {
-		// OpenAI 格式响应（完整版，对齐 new-api）
-		// 使用精确 usage 填充 cache 和 reasoning 信息
+		// OpenAI 格式响应
+		msg := OpenAIChatMessage{
+			Role:    "assistant",
+			Content: response,
+		}
+		// 如果有 thinking 内容，添加 reasoning_content 字段
 		resp := OpenAIChatResponse{
 			ID:                generateID("chatcmpl"),
 			Object:            "chat.completion",
@@ -2389,11 +2496,8 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 			SystemFingerprint: nil,
 			Choices: []OpenAIChatChoice{
 				{
-					Index: 0,
-					Message: OpenAIChatMessage{
-						Role:    "assistant",
-						Content: response,
-					},
+					Index:        0,
+					Message:      msg,
 					FinishReason: "stop",
 				},
 			},
@@ -2415,24 +2519,54 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 				},
 			},
 		}
-		// 累加全局统计（使用精确值）
-		addTokenStats(inputTokens, outputTokens)
-		c.JSON(200, resp)
+		// 如果有 thinking 内容，用 map 方式输出以包含 reasoning_content
+		if thinkingContent != "" {
+			respMap := map[string]any{
+				"id":                 resp.ID,
+				"object":             resp.Object,
+				"created":            resp.Created,
+				"model":              resp.Model,
+				"system_fingerprint": resp.SystemFingerprint,
+				"choices": []map[string]any{
+					{
+						"index": 0,
+						"message": map[string]any{
+							"role":              "assistant",
+							"content":           response,
+							"reasoning_content": thinkingContent,
+						},
+						"finish_reason": "stop",
+					},
+				},
+				"usage": resp.Usage,
+			}
+			addTokenStats(inputTokens, outputTokens)
+			c.JSON(200, respMap)
+		} else {
+			addTokenStats(inputTokens, outputTokens)
+			c.JSON(200, resp)
+		}
 	} else {
-		// Claude 格式响应（完整版，对齐 new-api）
-		// 使用精确 usage 填充 cache 信息
+		// Claude 格式响应：thinking 内容作为 thinking content block
+		var contentBlocks []ClaudeContentBlock
+		if thinkingContent != "" {
+			contentBlocks = append(contentBlocks, ClaudeContentBlock{
+				Type:     "thinking",
+				Thinking: thinkingContent,
+			})
+		}
+		contentBlocks = append(contentBlocks, ClaudeContentBlock{
+			Type: "text",
+			Text: response,
+		})
+
 		resp := ClaudeChatResponse{
 			ID:         generateID("msg"),
 			Type:       "message",
 			Role:       "assistant",
 			Model:      model,
 			StopReason: "end_turn",
-			Content: []ClaudeContentBlock{
-				{
-					Type: "text",
-					Text: response,
-				},
-			},
+			Content:    contentBlocks,
 			Usage: &kiroclient.ClaudeUsage{
 				InputTokens:              inputTokens,
 				OutputTokens:             outputTokens,
@@ -2440,7 +2574,6 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 				CacheReadInputTokens:     cacheReadTokens,
 			},
 		}
-		// 累加全局统计（使用精确值）
 		addTokenStats(inputTokens, outputTokens)
 		c.JSON(200, resp)
 	}
@@ -2492,10 +2625,54 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 		flusher.Flush()
 	}
 
-	// 标记是否已发送文本块开始
-	textBlockStarted := false
 	// 保存估算的 outputTokens（用于 message_delta 事件）
 	var estimatedOutputTokens int
+
+	// Claude 格式的 content block 状态管理（与 handleStreamResponse 对齐）
+	// 用于跟踪当前打开的 block 类型，实现 thinking/text block 切换
+	claudeBlockType := ""       // 当前打开的 block 类型："thinking" 或 "text" 或 ""（未开）
+	claudeBlockStarted := false // 是否有 block 已开启
+
+	// claudeCloseCurrentBlock 关闭当前打开的 Claude content block
+	claudeCloseCurrentBlock := func() {
+		if !claudeBlockStarted {
+			return
+		}
+		blockStop := map[string]any{
+			"type":  "content_block_stop",
+			"index": contentBlockIndex,
+		}
+		data, _ := json.Marshal(blockStop)
+		_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
+		claudeBlockStarted = false
+		contentBlockIndex++
+	}
+
+	// claudeEnsureBlock 确保当前打开的 block 类型正确，不对则切换
+	claudeEnsureBlock := func(blockType string) {
+		if claudeBlockStarted && claudeBlockType == blockType {
+			return // 已经是正确类型
+		}
+		// 关闭旧 block
+		claudeCloseCurrentBlock()
+		// 开新 block
+		var contentBlock map[string]any
+		if blockType == "thinking" {
+			contentBlock = map[string]any{"type": "thinking", "thinking": ""}
+		} else {
+			contentBlock = map[string]any{"type": "text", "text": ""}
+		}
+		blockStart := map[string]any{
+			"type":          "content_block_start",
+			"index":         contentBlockIndex,
+			"content_block": contentBlock,
+		}
+		data, _ := json.Marshal(blockStart)
+		_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
+		claudeBlockStarted = true
+		claudeBlockType = blockType
+		flusher.Flush()
+	}
 
 	// 创建 thinking 文本处理器
 	// 参考 Kiro-account-manager proxyServer.ts 的 processText 函数
@@ -2504,43 +2681,27 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			return
 		}
 
-		// 如果还没开始文本块，先发送 content_block_start
-		if !textBlockStarted {
-			blockStart := map[string]any{
-				"type":  "content_block_start",
-				"index": contentBlockIndex,
-				"content_block": map[string]any{
-					"type": "text",
-					"text": "",
-				},
-			}
-			data, _ := json.Marshal(blockStart)
-			_, _ = fmt.Fprintf(c.Writer, "event: content_block_start\ndata: %s\n\n", string(data))
-			textBlockStarted = true
-			contentBlockIndex++
-		}
-
 		outputBuilder.WriteString(text)
 
-		// 发送 content_block_delta
-		// 如果是 reasoning_content 格式且 isThinking=true，使用 reasoning_content 字段
 		if isThinking && proxyConfig.ThinkingOutputFormat == kiroclient.ThinkingFormatReasoningContent {
-			// OpenAI 格式的 reasoning_content
+			// thinking 内容：确保 thinking block 已打开
+			claudeEnsureBlock("thinking")
 			chunk := map[string]any{
 				"type":  "content_block_delta",
-				"index": contentBlockIndex - 1,
+				"index": contentBlockIndex,
 				"delta": map[string]any{
-					"type":              "text_delta",
-					"reasoning_content": text,
+					"type":     "thinking_delta",
+					"thinking": text,
 				},
 			}
 			data, _ := json.Marshal(chunk)
 			_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(data))
 		} else {
-			// 普通文本或已转换的 <thinking>/<think> 标签
+			// 普通文本或已转换的 <thinking>/<think> 标签：确保 text block 已打开
+			claudeEnsureBlock("text")
 			chunk := map[string]any{
 				"type":  "content_block_delta",
-				"index": contentBlockIndex - 1,
+				"index": contentBlockIndex,
 				"delta": map[string]string{
 					"type": "text_delta",
 					"text": text,
@@ -2561,15 +2722,8 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
 			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
-			// 关闭文本块（如果已开始）
-			if textBlockStarted {
-				blockStop := map[string]any{
-					"type":  "content_block_stop",
-					"index": contentBlockIndex - 1,
-				}
-				data, _ := json.Marshal(blockStop)
-				_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
-			}
+			// 关闭当前打开的 content block（可能是 thinking/text）
+			claudeCloseCurrentBlock()
 
 			// 发送 message_delta 事件
 			// 只有真正有工具调用时才返回 tool_use，而不是根据 contentBlockIndex 判断
@@ -2655,16 +2809,8 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			// 刷新 thinking 处理器缓冲区
 			thinkingProcessor.Flush()
 
-			// 关闭之前的文本块
-			if textBlockStarted {
-				blockStop := map[string]any{
-					"type":  "content_block_stop",
-					"index": contentBlockIndex - 1,
-				}
-				data, _ := json.Marshal(blockStop)
-				_, _ = fmt.Fprintf(c.Writer, "event: content_block_stop\ndata: %s\n\n", string(data))
-				textBlockStarted = false
-			}
+			// 关闭之前的 content block（可能是 thinking 或 text）
+			claudeCloseCurrentBlock()
 
 			// 还原工具名（如果有映射）
 			toolName := toolUse.Name
@@ -2717,8 +2863,9 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 		if !kiroclient.IsNonCircuitBreakingError(err) {
 			recordAccountRequest(accountID, email, 500, err.Error())
 		}
-		// 记录流式响应（带工具）错误
+		// 记录流式响应（带工具）错误（与非流式对齐，记录完整错误上下文）
 		if logger != nil {
+			RecordErrorFromGin(c, logger, err, accountID)
 			logger.Error(GetMsgID(c), "流式响应(Tools)失败", map[string]any{
 				"format":     format,
 				"model":      model,
@@ -2761,12 +2908,46 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	estimatedInputTokens := kiroclient.CountMessagesTokens(messages)
 
 	var responseText strings.Builder
+	var thinkingText strings.Builder
 	var toolUses []*kiroclient.KiroToolUse
+
+	// 创建 thinking 文本处理器（与流式对齐，检测普通文本中的 <thinking> 标签）
+	thinkingProcessor := kiroclient.NewThinkingTextProcessor(proxyConfig.ThinkingOutputFormat, func(text string, isThinking bool) {
+		if text == "" {
+			return
+		}
+		if isThinking && proxyConfig.ThinkingOutputFormat == kiroclient.ThinkingFormatReasoningContent {
+			// reasoning_content 格式：thinking 内容单独存储
+			thinkingText.WriteString(text)
+		} else {
+			// 普通文本或已转换的 <thinking>/<think> 标签
+			responseText.WriteString(text)
+		}
+	})
 
 	// 使用 ChatStreamWithToolsAndUsage 获取精确 usage
 	usage, err := client.Chat.ChatStreamWithToolsAndUsage(c.Request.Context(), messages, model, tools, toolResults, func(content string, toolUse *kiroclient.KiroToolUse, done bool, isThinking bool) {
+		if done {
+			// 刷新 thinking 处理器缓冲区
+			thinkingProcessor.Flush()
+			return
+		}
 		if content != "" {
-			responseText.WriteString(content)
+			if isThinking {
+				// reasoningContentEvent 的思考内容，直接通过 callback 处理
+				switch proxyConfig.ThinkingOutputFormat {
+				case kiroclient.ThinkingFormatThinking:
+					thinkingProcessor.Callback("<thinking>"+content+"</thinking>", false)
+				case kiroclient.ThinkingFormatThink:
+					thinkingProcessor.Callback("<think>"+content+"</think>", false)
+				default:
+					// reasoning_content 格式
+					thinkingProcessor.Callback(content, true)
+				}
+			} else {
+				// 普通文本，通过 processText 检测 <thinking> 标签
+				thinkingProcessor.ProcessText(content, false)
+			}
 		}
 		if toolUse != nil {
 			toolUses = append(toolUses, toolUse)
@@ -2807,6 +2988,14 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 
 	// 构建 content 数组
 	var contentBlocks []map[string]any
+
+	// 添加 thinking 块（如果有 thinking 内容，放在 text 块前面）
+	if thinkingText.Len() > 0 {
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type":     "thinking",
+			"thinking": thinkingText.String(),
+		})
+	}
 
 	// 添加文本块
 	if responseText.Len() > 0 {

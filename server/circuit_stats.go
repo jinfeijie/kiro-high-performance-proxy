@@ -38,27 +38,46 @@ type AccountCircuitStats struct {
 type CircuitStats struct {
 	accounts map[string]*AccountCircuitStats
 	mu       sync.RWMutex
+	stopCh   chan struct{} // 用于通知后台清理协程退出，防止 goroutine 泄漏
 }
 
 // ========== 构造函数 ==========
 
 // NewCircuitStats 创建全局错误率统计器
 // 启动后台清理协程,定期清理过期时间桶,防止内存泄漏
+// 调用方必须在不再使用时调用 Close() 释放后台协程
 func NewCircuitStats() *CircuitStats {
 	cs := &CircuitStats{
 		accounts: make(map[string]*AccountCircuitStats),
+		stopCh:   make(chan struct{}),
 	}
 
 	// 启动后台清理协程(每1分钟清理一次过期桶)
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			cs.cleanup()
+		for {
+			select {
+			case <-ticker.C:
+				cs.cleanup()
+			case <-cs.stopCh:
+				return
+			}
 		}
 	}()
 
 	return cs
+}
+
+// Close 关闭后台清理协程，释放资源
+// 在测试中必须调用，防止 goroutine 泄漏
+func (cs *CircuitStats) Close() {
+	select {
+	case <-cs.stopCh:
+		// 已经关闭过了，避免重复 close panic
+	default:
+		close(cs.stopCh)
+	}
 }
 
 // ClearAccount 清除指定账号的所有统计数据
@@ -71,7 +90,7 @@ func (cs *CircuitStats) ClearAccount(accountID string) {
 
 // ========== 核心方法 ==========
 
-// alignToB bucket 将时间戳对齐到10秒边界
+// alignToBucket 将时间戳对齐到10秒边界
 // 例如：1234567 -> 1234560
 func alignToBucket(ts int64) int64 {
 	return ts - ts%bucketSeconds
