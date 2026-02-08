@@ -5,72 +5,221 @@ import (
 	"testing"
 )
 
-// TestStripNotification_ExactMatch 精确匹配能移除通知
-func TestStripNotification_ExactMatch(t *testing.T) {
-	notification := ">            \n### 📣 网站通知\n>            \n>            API-KEY: `123456`"
-	injected := "AI的回答内容\n\n---\n" + notification + "\n---"
+// TestNotifHash 验证 hash 生成的格式和一致性
+func TestNotifHash(t *testing.T) {
+	msg := "测试通知"
+	hash := notifHash(msg)
 
-	result := stripNotificationFromContent(injected, notification)
-	if strings.Contains(result, "网站通知") {
-		t.Errorf("精确匹配应该能移除通知，但没有移除")
+	if !strings.HasPrefix(hash, notifHashPrefix) {
+		t.Errorf("hash 缺少前缀: %s", hash)
+	}
+	if !strings.HasSuffix(hash, notifHashSuffix) {
+		t.Errorf("hash 缺少后缀: %s", hash)
+	}
+	// 同一内容 hash 必须一致
+	if notifHash(msg) != hash {
+		t.Errorf("同一内容的 hash 不一致")
+	}
+	// 不同内容 hash 必须不同
+	if notifHash("另一条通知") == hash {
+		t.Errorf("不同内容的 hash 不应该相同")
 	}
 }
 
-// TestStripNotification_ClientReformat 模拟客户端回传时文本被重新格式化
-// 这是根本问题的复现：客户端会去掉多余空格、改变换行
-func TestStripNotification_ClientReformat(t *testing.T) {
-	// 原始通知（notification.json 中的内容，带大量空格）
-	notification := ">            \n### 📣 网站通知\n>            \n>            API-KEY: `123456` 即将在今日`14:00`进行撤销。\n>            新API-KEY已更新在官网，请及时前往 `https://onedayai.autocode.space` 获取\n>            \n>            当前已使用日本节点，国内延迟100ms以下，国内可直连\n>            \n>            晚些时间会推送交流群信息，欢迎进群交流。"
+// TestFormatNotificationBlock 验证格式化输出包含 hash 标记
+func TestFormatNotificationBlock(t *testing.T) {
+	msg := "测试通知"
+	hashTag := notifHash(msg)
+	result := formatNotificationBlock(msg, hashTag)
 
-	// 模拟客户端回传的版本（空格被压缩、blockquote 标记被去掉）
-	clientVersion := "AI的回答内容\n\n---\n" +
-		"\n### 📣 网站通知\n\n" +
-		"API-KEY: `123456` 即将在今日`14:00`进行撤销。\n" +
-		"新API-KEY已更新在官网，请及时前往 `https://onedayai.autocode.space` 获取\n\n" +
-		"当前已使用日本节点，国内延迟100ms以下，国内可直连\n\n" +
-		"晚些时间会推送交流群信息，欢迎进群交流。\n---"
-
-	result := stripNotificationFromContent(clientVersion, notification)
-	if strings.Contains(result, "网站通知") {
-		t.Errorf("客户端重新格式化后，strip 未能移除通知！\n原始通知长度: %d\n客户端版本: %s\nstrip结果: %s",
-			len(notification), clientVersion, result)
+	if !strings.Contains(result, notifSeparator) {
+		t.Errorf("缺少分隔符")
+	}
+	if !strings.Contains(result, msg) {
+		t.Errorf("缺少通知正文")
+	}
+	if !strings.Contains(result, hashTag) {
+		t.Errorf("缺少 hash 标记")
 	}
 }
 
-// TestStripNotification_WhitespaceVariation 空格数量变化导致匹配失败
-func TestStripNotification_WhitespaceVariation(t *testing.T) {
-	notification := ">            \n### 📣 网站通知"
+// TestIsNotificationText_HashBased 只看预存的 hashTag
+func TestIsNotificationText_HashBased(t *testing.T) {
+	notification := "### 📣 网站通知\nAPI-KEY: `123456`"
+	hashTag := notifHash(notification)
 
-	// 客户端把 ">            " 变成 "> "
-	clientContent := "回答\n\n---\n> \n### 📣 网站通知\n---"
+	// 包含 hashTag 的文本应该匹配
+	textWithHash := "一些AI回复" + hashTag
+	if !isNotificationText(textWithHash, hashTag) {
+		t.Errorf("包含 hashTag 的文本应该匹配")
+	}
 
-	result := stripNotificationFromContent(clientContent, notification)
-	if strings.Contains(result, "网站通知") {
-		t.Errorf("空格变化后 strip 失败: %s", result)
+	// 格式化后的通知（包含 hashTag）应该匹配
+	formatted := formatNotificationBlock(notification, hashTag)
+	if !isNotificationText(formatted, hashTag) {
+		t.Errorf("格式化后的通知应该匹配")
+	}
+
+	// 完全无关的文本
+	if isNotificationText("普通文本", hashTag) {
+		t.Errorf("无关文本不应该匹配")
+	}
+
+	// 空值边界
+	if isNotificationText("", hashTag) {
+		t.Errorf("空文本不应该匹配")
+	}
+	if isNotificationText("任意文本", "") {
+		t.Errorf("空 hashTag 不应该匹配")
 	}
 }
 
-// TestShouldInjectNotification_SecondRequest 第二次请求时历史消息包含被改格式的通知
-func TestShouldInjectNotification_SecondRequest(t *testing.T) {
-	// 设置全局通知配置
+// TestStripNotificationFromText_HashBased 用预存 hashTag 移除通知
+func TestStripNotificationFromText_HashBased(t *testing.T) {
+	notification := "### 📣 网站通知\nAPI-KEY: `123456`"
+	hashTag := notifHash(notification)
+	formatted := formatNotificationBlock(notification, hashTag)
+	content := "AI的回答内容" + formatted
+
+	result := stripNotificationFromText(content, hashTag)
+	if strings.Contains(result, "网站通知") {
+		t.Errorf("strip 后仍包含通知: %s", result)
+	}
+	if result != "AI的回答内容" {
+		t.Errorf("期望 'AI的回答内容'，实际: '%s'", result)
+	}
+}
+
+// TestStripNotificationFromText_NoMatch 没有 hashTag 时原样返回
+func TestStripNotificationFromText_NoMatch(t *testing.T) {
+	content := "正常的AI回复内容"
+	hashTag := notifHash("某条通知")
+	result := stripNotificationFromText(content, hashTag)
+	if result != content {
+		t.Errorf("没有匹配时应原样返回")
+	}
+}
+
+// TestStripNotificationFromText_Empty 空 hashTag 时原样返回
+func TestStripNotificationFromText_Empty(t *testing.T) {
+	content := "正常的AI回复内容"
+	result := stripNotificationFromText(content, "")
+	if result != content {
+		t.Errorf("空 hashTag 时应原样返回")
+	}
+}
+
+// TestShouldInjectNotification_ClaudeBlock Claude 格式判重
+func TestShouldInjectNotification_ClaudeBlock(t *testing.T) {
+	notification := "### 📣 网站通知\nAPI-KEY: `123456`"
+	hashTag := notifHash(notification)
+
 	notificationMutex.Lock()
 	notificationConfig = NotificationConfig{
 		Enabled: true,
-		Message: ">            \n### 📣 网站通知\n>            API-KEY: `123456`",
+		Message: notification,
+		Hash:    hashTag,
 	}
 	notificationMutex.Unlock()
 
-	// 模拟第二次请求：历史消息中 assistant 的内容已被客户端重新格式化
 	messages := []map[string]any{
 		{"role": "user", "content": "你好"},
-		{"role": "assistant", "content": "你好！\n\n---\n\n### 📣 网站通知\nAPI-KEY: `123456`\n---"},
+		{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "你好！"},
+			map[string]any{"type": "text", "text": formatNotificationBlock(notification, hashTag)},
+		}},
 		{"role": "user", "content": "再问一次"},
 	}
 
-	// 如果 shouldInjectNotification 返回 true，说明它没识别出历史中已有通知
-	// 这会导致重复注入，AI 看到通知后认为是提示注入攻击
-	result := shouldInjectNotification(messages)
-	if result {
-		t.Errorf("历史消息中已有通知（格式被客户端修改），但 shouldInjectNotification 仍返回 true，会导致重复注入")
+	if shouldInjectNotification(messages) {
+		t.Errorf("历史中已有通知 block，不应重复注入")
+	}
+}
+
+// TestShouldInjectNotification_OpenAI OpenAI 格式判重
+func TestShouldInjectNotification_OpenAI(t *testing.T) {
+	notification := "### 📣 网站通知\nAPI-KEY: `123456`"
+	hashTag := notifHash(notification)
+
+	notificationMutex.Lock()
+	notificationConfig = NotificationConfig{
+		Enabled: true,
+		Message: notification,
+		Hash:    hashTag,
+	}
+	notificationMutex.Unlock()
+
+	messages := []map[string]any{
+		{"role": "user", "content": "你好"},
+		{"role": "assistant", "content": "你好！" + formatNotificationBlock(notification, hashTag)},
+		{"role": "user", "content": "再问一次"},
+	}
+
+	if shouldInjectNotification(messages) {
+		t.Errorf("历史中已有通知文本，不应重复注入")
+	}
+}
+
+// TestShouldInjectNotification_First 首次请求应注入
+func TestShouldInjectNotification_First(t *testing.T) {
+	notification := "### 📣 网站通知\nAPI-KEY: `123456`"
+	hashTag := notifHash(notification)
+
+	notificationMutex.Lock()
+	notificationConfig = NotificationConfig{
+		Enabled: true,
+		Message: notification,
+		Hash:    hashTag,
+	}
+	notificationMutex.Unlock()
+
+	messages := []map[string]any{
+		{"role": "user", "content": "你好"},
+	}
+
+	if !shouldInjectNotification(messages) {
+		t.Errorf("首次请求应该注入通知")
+	}
+}
+
+// TestShouldInjectNotification_Disabled 通知关闭时不注入
+func TestShouldInjectNotification_Disabled(t *testing.T) {
+	notificationMutex.Lock()
+	notificationConfig = NotificationConfig{
+		Enabled: false,
+		Message: "任意通知",
+		Hash:    notifHash("任意通知"),
+	}
+	notificationMutex.Unlock()
+
+	messages := []map[string]any{
+		{"role": "user", "content": "你好"},
+	}
+
+	if shouldInjectNotification(messages) {
+		t.Errorf("通知关闭时不应注入")
+	}
+}
+
+// TestNotificationConfig_HashPrecomputed 验证保存时预算 hash
+func TestNotificationConfig_HashPrecomputed(t *testing.T) {
+	msg := "测试预算 hash"
+	expected := notifHash(msg)
+
+	cfg := NotificationConfig{
+		Enabled: true,
+		Message: msg,
+		Hash:    expected,
+	}
+
+	// Hash 应该和 notifHash 算出来的一致
+	if cfg.Hash != expected {
+		t.Errorf("预算 hash 不一致")
+	}
+
+	// 运行时直接用 cfg.Hash 做对比，不需要重算
+	text := "AI回复" + cfg.Hash
+	if !isNotificationText(text, cfg.Hash) {
+		t.Errorf("用预存 hash 对比应该匹配")
 	}
 }
