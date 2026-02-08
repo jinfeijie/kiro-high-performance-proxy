@@ -810,3 +810,221 @@ func TestContainsDebugKeyword_MultipleMessages(t *testing.T) {
 		t.Error("多条消息中应该检测到关键字")
 	}
 }
+
+// ========== extractSystemPrompt 测试 ==========
+
+func TestExtractSystemPrompt_Nil(t *testing.T) {
+	result := extractSystemPrompt(nil)
+	if result != "" {
+		t.Errorf("nil 应返回空字符串，实际: %q", result)
+	}
+}
+
+func TestExtractSystemPrompt_String(t *testing.T) {
+	result := extractSystemPrompt("You are a helpful assistant.")
+	if result != "You are a helpful assistant." {
+		t.Errorf("字符串格式解析错误，实际: %q", result)
+	}
+}
+
+func TestExtractSystemPrompt_Array(t *testing.T) {
+	// Claude 格式：system 是 [{type: "text", text: "..."}] 数组
+	system := []interface{}{
+		map[string]interface{}{"type": "text", "text": "Part 1"},
+		map[string]interface{}{"type": "text", "text": "Part 2"},
+	}
+	result := extractSystemPrompt(system)
+	if result != "Part 1\nPart 2" {
+		t.Errorf("数组格式解析错误，实际: %q", result)
+	}
+}
+
+func TestExtractSystemPrompt_EmptyArray(t *testing.T) {
+	system := []interface{}{}
+	result := extractSystemPrompt(system)
+	if result != "" {
+		t.Errorf("空数组应返回空字符串，实际: %q", result)
+	}
+}
+
+// ========== convertToKiroMessagesWithSystem 测试 ==========
+
+// TestConvertSystemPrompt_HistoryInjection 验证 system prompt 作为 history 首条配对注入
+func TestConvertSystemPrompt_HistoryInjection(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "Hello"},
+	}
+	system := "You are a helpful assistant."
+
+	msgs, _, _, _ := convertToKiroMessagesWithSystem(messages, system, nil)
+
+	// 应该有 3 条消息：system(user) + system(assistant) + 原始 user
+	if len(msgs) != 3 {
+		t.Fatalf("期望 3 条消息，实际: %d", len(msgs))
+	}
+
+	// 第一条：system prompt 作为 user 消息，无标记
+	if msgs[0].Role != "user" {
+		t.Errorf("第一条应为 user，实际: %s", msgs[0].Role)
+	}
+	if msgs[0].Content != "You are a helpful assistant." {
+		t.Errorf("system 内容不应有标记，实际: %q", msgs[0].Content)
+	}
+
+	// 第二条：assistant 确认
+	if msgs[1].Role != "assistant" {
+		t.Errorf("第二条应为 assistant，实际: %s", msgs[1].Role)
+	}
+	if msgs[1].Content != "I will follow these instructions." {
+		t.Errorf("assistant 回复不对，实际: %q", msgs[1].Content)
+	}
+
+	// 第三条：原始 user 消息
+	if msgs[2].Role != "user" {
+		t.Errorf("第三条应为 user，实际: %s", msgs[2].Role)
+	}
+	if msgs[2].Content != "Hello" {
+		t.Errorf("原始消息被篡改，实际: %q", msgs[2].Content)
+	}
+}
+
+// TestConvertSystemPrompt_NoMarkers 验证不包含任何 --- SYSTEM PROMPT --- 标记
+func TestConvertSystemPrompt_NoMarkers(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "Hello"},
+	}
+	system := "You are a coding assistant."
+
+	msgs, _, _, _ := convertToKiroMessagesWithSystem(messages, system, nil)
+
+	for i, msg := range msgs {
+		if contains := len(msg.Content) > 0 && (msg.Content == "--- SYSTEM PROMPT ---" ||
+			containsStr(msg.Content, "--- SYSTEM PROMPT ---") ||
+			containsStr(msg.Content, "--- END SYSTEM PROMPT ---")); contains {
+			t.Errorf("消息 %d 包含旧标记: %q", i, msg.Content)
+		}
+	}
+}
+
+// TestConvertSystemPrompt_EmptyMessages 验证无消息 + 有 system 的情况
+func TestConvertSystemPrompt_EmptyMessages(t *testing.T) {
+	messages := []map[string]any{}
+	system := "You are a helpful assistant."
+
+	msgs, _, _, _ := convertToKiroMessagesWithSystem(messages, system, nil)
+
+	// 应该有 3 条：system(user) + system(assistant) + Continue(user)
+	if len(msgs) != 3 {
+		t.Fatalf("期望 3 条消息，实际: %d", len(msgs))
+	}
+
+	if msgs[0].Role != "user" || msgs[0].Content != "You are a helpful assistant." {
+		t.Errorf("第一条不对: role=%s content=%q", msgs[0].Role, msgs[0].Content)
+	}
+	if msgs[1].Role != "assistant" || msgs[1].Content != "I will follow these instructions." {
+		t.Errorf("第二条不对: role=%s content=%q", msgs[1].Role, msgs[1].Content)
+	}
+	if msgs[2].Role != "user" || msgs[2].Content != "Continue" {
+		t.Errorf("第三条不对: role=%s content=%q", msgs[2].Role, msgs[2].Content)
+	}
+}
+
+// TestConvertSystemPrompt_NoSystem 验证无 system prompt 时行为不变
+func TestConvertSystemPrompt_NoSystem(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "Hello"},
+		{"role": "assistant", "content": "Hi there"},
+	}
+
+	msgs, _, _, _ := convertToKiroMessagesWithSystem(messages, nil, nil)
+
+	// 无 system 时不应插入额外消息
+	if len(msgs) != 2 {
+		t.Fatalf("期望 2 条消息，实际: %d", len(msgs))
+	}
+	if msgs[0].Role != "user" || msgs[0].Content != "Hello" {
+		t.Errorf("第一条不对: role=%s content=%q", msgs[0].Role, msgs[0].Content)
+	}
+	if msgs[1].Role != "assistant" || msgs[1].Content != "Hi there" {
+		t.Errorf("第二条不对: role=%s content=%q", msgs[1].Role, msgs[1].Content)
+	}
+}
+
+// TestConvertSystemPrompt_WithToolResults 验证 system prompt + tool_results 组合
+func TestConvertSystemPrompt_WithToolResults(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": []interface{}{
+			map[string]interface{}{
+				"type":        "tool_result",
+				"tool_use_id": "toolu_123",
+				"content":     "file content here",
+			},
+		}},
+	}
+	system := "You are a coding assistant."
+
+	msgs, _, lastToolResults, _ := convertToKiroMessagesWithSystem(messages, system, nil)
+
+	// system 配对 + 原始 user（带 tool_result）= 3 条
+	if len(msgs) != 3 {
+		t.Fatalf("期望 3 条消息，实际: %d", len(msgs))
+	}
+
+	// system 配对在前面
+	if msgs[0].Content != "You are a coding assistant." {
+		t.Errorf("system 内容不对: %q", msgs[0].Content)
+	}
+
+	// 最后一条 user 消息应有 tool_results
+	lastMsg := msgs[len(msgs)-1]
+	if lastMsg.Role != "user" {
+		t.Errorf("最后一条应为 user，实际: %s", lastMsg.Role)
+	}
+	if len(lastMsg.ToolResults) != 1 {
+		t.Fatalf("期望 1 个 toolResult，实际: %d", len(lastMsg.ToolResults))
+	}
+
+	// lastToolResults 应该来自最后一条 user 消息
+	if len(lastToolResults) != 1 {
+		t.Fatalf("期望 1 个 lastToolResult，实际: %d", len(lastToolResults))
+	}
+	if lastToolResults[0].ToolUseId != "toolu_123" {
+		t.Errorf("toolUseId 不对: %s", lastToolResults[0].ToolUseId)
+	}
+}
+
+// TestConvertSystemPrompt_ArrayFormat 验证 system 为数组格式时的处理
+func TestConvertSystemPrompt_ArrayFormat(t *testing.T) {
+	messages := []map[string]any{
+		{"role": "user", "content": "Hello"},
+	}
+	system := []interface{}{
+		map[string]interface{}{"type": "text", "text": "Part 1"},
+		map[string]interface{}{"type": "text", "text": "Part 2"},
+	}
+
+	msgs, _, _, _ := convertToKiroMessagesWithSystem(messages, system, nil)
+
+	if len(msgs) != 3 {
+		t.Fatalf("期望 3 条消息，实际: %d", len(msgs))
+	}
+
+	// system 内容应该是 join 后的结果
+	if msgs[0].Content != "Part 1\nPart 2" {
+		t.Errorf("数组格式 system 解析不对: %q", msgs[0].Content)
+	}
+}
+
+// containsStr 简单的字符串包含检查（测试辅助函数）
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && findSubstr(s, substr))
+}
+
+func findSubstr(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

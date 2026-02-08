@@ -1847,22 +1847,23 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 		})
 	}
 
-	// 将 system prompt 合并到最后一条 user 消息的 content 开头
-	if systemPrompt != "" && len(kiroMessages) > 0 {
-		for i := len(kiroMessages) - 1; i >= 0; i-- {
-			if kiroMessages[i].Role == "user" {
-				kiroMessages[i].Content = "--- SYSTEM PROMPT ---\n" + systemPrompt + "\n--- END SYSTEM PROMPT ---\n\n" + kiroMessages[i].Content
-				break
-			}
+	// 对齐 kiro.rs 方案：system prompt 作为 history 首条 user+assistant 配对注入
+	// 不加任何标记，避免模型在回复中引用标记暴露降级痕迹
+	if systemPrompt != "" {
+		systemPair := []kiroclient.ChatMessage{
+			{Role: "user", Content: systemPrompt},
+			{Role: "assistant", Content: "I will follow these instructions."},
 		}
-	}
-
-	// 如果没有任何消息但有 system prompt，创建一条
-	if len(kiroMessages) == 0 && systemPrompt != "" {
-		kiroMessages = append(kiroMessages, kiroclient.ChatMessage{
-			Role:    "user",
-			Content: "--- SYSTEM PROMPT ---\n" + systemPrompt + "\n--- END SYSTEM PROMPT ---\n\nContinue",
-		})
+		if len(kiroMessages) > 0 {
+			// 有消息时：system 配对插入到 history 最前面
+			kiroMessages = append(systemPair, kiroMessages...)
+		} else {
+			// 无消息时：system 配对 + 一条 Continue 的 user 消息
+			kiroMessages = append(systemPair, kiroclient.ChatMessage{
+				Role:    "user",
+				Content: "Continue",
+			})
+		}
 	}
 
 	// 关键修复：只返回最后一条 user 消息的 toolResults
