@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,20 @@ import (
 // 让前端能看到请求的 msgId，便于排查问题
 func errorJSONWithMsgId(c *gin.Context, code int, errVal any) {
 	c.JSON(code, gin.H{"error": errVal, "msgId": GetMsgID(c)})
+}
+
+// 通知标记常量（纯零宽字符序列，客户端渲染时完全不可见）
+// Start: 零宽空格 + Word Joiner + 零宽非连接符 + 零宽空格
+// End:   零宽空格 + 零宽非连接符 + Word Joiner + 零宽空格
+const notifMarkerStart = "\u200B\u2060\u200C\u200B"
+const notifMarkerEnd = "\u200B\u200C\u2060\u200B"
+
+// notifStripRegex 用于从历史消息中移除标记包裹的通知内容
+var notifStripRegex = regexp.MustCompile(`\x{200B}\x{2060}\x{200C}\x{200B}[\s\S]*?\x{200B}\x{200C}\x{2060}\x{200B}`)
+
+// wrapNotification 用标记包裹通知文本，方便后续精确移除
+func wrapNotification(msg string) string {
+	return "\n\n---\n" + notifMarkerStart + msg + notifMarkerEnd + "\n---"
 }
 
 // computeHash 计算数据的 MD5 hash（前8位）
@@ -185,6 +200,17 @@ var tokenStatsChan = make(chan TokenDelta, 1000) // 异步写入通道
 
 // ========== 熔断错误率统计 ==========
 var circuitStats *CircuitStats
+
+// ========== 系统通知配置 ==========
+var notificationFile = "notification.json"
+var notificationConfig NotificationConfig
+var notificationMutex sync.RWMutex
+
+// NotificationConfig 系统通知配置
+type NotificationConfig struct {
+	Enabled bool   `json:"enabled"`
+	Message string `json:"message"`
+}
 
 // ========== 账号调用统计 ==========
 var accountStatsFile = "account-stats.json"
@@ -770,6 +796,189 @@ func saveRateLimitConfig() error {
 	return os.WriteFile(rateLimitFile, data, 0644)
 }
 
+// ========== 系统通知配置函数 ==========
+
+// loadNotificationConfig 加载系统通知配置
+func loadNotificationConfig() {
+	data, err := os.ReadFile(notificationFile)
+	if err != nil {
+		notificationConfig = NotificationConfig{Enabled: false, Message: ""}
+		return
+	}
+	if err := json.Unmarshal(data, &notificationConfig); err != nil {
+		notificationConfig = NotificationConfig{Enabled: false, Message: ""}
+		return
+	}
+	if logger != nil {
+		logger.Info("", "系统通知配置已加载", map[string]any{
+			"enabled": notificationConfig.Enabled,
+		})
+	}
+}
+
+// saveNotificationConfig 保存系统通知配置
+func saveNotificationConfig() error {
+	data, err := json.MarshalIndent(notificationConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(notificationFile, data, 0644)
+}
+
+// getNotificationMessage 获取当前通知消息（线程安全）
+func getNotificationMessage() (bool, string) {
+	notificationMutex.RLock()
+	defer notificationMutex.RUnlock()
+	return notificationConfig.Enabled, notificationConfig.Message
+}
+
+// normalizeNotifText 归一化通知文本，用于模糊比较
+// 客户端回传时会重新格式化 Markdown（去掉 > 前缀空格、压缩空行等），
+// 归一化后两边文本可以做 Contains 匹配
+func normalizeNotifText(s string) string {
+	lines := strings.Split(s, "\n")
+	var parts []string
+	for _, line := range lines {
+		// 去掉 blockquote 前缀 "> " 及其后面的空格
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, ">") {
+			line = strings.TrimSpace(line[1:])
+		}
+		// 跳过 --- 分隔线
+		if line == "---" {
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		parts = append(parts, line)
+	}
+	return strings.Join(parts, " ")
+}
+
+// notifSectionRegex 匹配 --- 包裹的包含 📣 的通知区块（兼容客户端重新格式化后的版本）
+var notifSectionRegex = regexp.MustCompile(`(?s)\n*---\n.*?📣.*?\n---`)
+
+// stripNotificationFromContent 从历史消息中移除注入的通知
+// 优先用零宽标记正则匹配（不依赖通知文本精确一致），兜底用文本匹配
+func stripNotificationFromContent(content string, notification string) string {
+	if notification == "" {
+		return content
+	}
+	original := content
+
+	// 第1层：正则匹配零宽标记包裹的通知（不依赖通知文本精确匹配）
+	content = notifStripRegex.ReplaceAllString(content, "")
+
+	// 第2层：匹配新格式（无标记版本，兼容旧注入）
+	newMarker := "\n\n---\n" + notification + "\n---"
+	content = strings.ReplaceAll(content, newMarker, "")
+
+	// 第3层：直接移除通知文本
+	content = strings.ReplaceAll(content, notification, "")
+
+	// 第4层：正则匹配 --- 包裹的含 📣 的区块（兼容客户端重新格式化后的版本）
+	// 客户端会去掉 > 前缀空格、改变换行，导致前3层都匹配不到
+	content = notifSectionRegex.ReplaceAllString(content, "")
+
+	// 清理多余空行
+	for strings.Contains(content, "\n\n\n") {
+		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
+	}
+	content = strings.TrimSpace(content)
+
+	if content != original && logger != nil {
+		logger.Debug("", "已过滤历史消息中的通知", map[string]any{
+			"originalLen": len(original),
+			"filteredLen": len(content),
+		})
+	}
+
+	return content
+}
+
+// shouldInjectNotification 检查是否应该注入通知
+// 逻辑：如果历史 assistant 消息中已包含通知文本，说明本 session 已注入过，跳过
+// 这样保证一个 session（对话）只出现一次通知
+func shouldInjectNotification(messages []map[string]any) bool {
+	enabled, msg := getNotificationMessage()
+	if !enabled || msg == "" {
+		return false
+	}
+	// 归一化通知文本，用于模糊匹配客户端重新格式化后的版本
+	normalizedMsg := normalizeNotifText(msg)
+
+	// 遍历历史消息，检查 assistant 消息中是否已有通知
+	// 同时检查零宽标记、原始文本、归一化文本（兼容新旧格式和客户端重新格式化）
+	for _, m := range messages {
+		role, _ := m["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		switch v := m["content"].(type) {
+		case string:
+			if strings.Contains(v, notifMarkerStart) || strings.Contains(v, msg) {
+				return false
+			}
+			// 归一化比较：客户端重新格式化后精确匹配失败，用归一化文本兜底
+			if normalizedMsg != "" && strings.Contains(normalizeNotifText(v), normalizedMsg) {
+				return false
+			}
+		case []interface{}:
+			for _, item := range v {
+				if block, ok := item.(map[string]interface{}); ok {
+					if text, ok := block["text"].(string); ok {
+						if strings.Contains(text, notifMarkerStart) || strings.Contains(text, msg) {
+							return false
+						}
+						if normalizedMsg != "" && strings.Contains(normalizeNotifText(text), normalizedMsg) {
+							return false
+						}
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+// handleGetNotification 获取系统通知配置
+func handleGetNotification(c *gin.Context) {
+	notificationMutex.RLock()
+	cfg := notificationConfig
+	notificationMutex.RUnlock()
+	c.JSON(200, gin.H{
+		"enabled": cfg.Enabled,
+		"message": cfg.Message,
+	})
+}
+
+// handleUpdateNotification 更新系统通知配置
+func handleUpdateNotification(c *gin.Context) {
+	var req struct {
+		Enabled bool   `json:"enabled"`
+		Message string `json:"message"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	notificationMutex.Lock()
+	notificationConfig.Enabled = req.Enabled
+	notificationConfig.Message = req.Message
+	notificationMutex.Unlock()
+
+	if err := saveNotificationConfig(); err != nil {
+		if logger != nil {
+			RecordErrorFromGin(c, logger, err, "")
+		}
+		c.JSON(500, gin.H{"error": "保存失败: " + err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"message": "系统通知配置已更新"})
+}
+
 // rateLimitMiddleware 限流中间件（仅对 /v1/* 生效）
 func rateLimitMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -1084,6 +1293,9 @@ func main() {
 	// 加载限流配置
 	loadRateLimitConfig()
 
+	// 加载系统通知配置
+	loadNotificationConfig()
+
 	// 加载 Token 统计数据并启动后台写入协程
 	loadTokenStats()
 	go tokenStatsWorker()
@@ -1182,6 +1394,10 @@ func main() {
 		// 日志级别配置
 		api.GET("/settings/log-level", handleGetLogLevel)
 		api.POST("/settings/log-level", handleUpdateLogLevel)
+
+		// 系统通知配置
+		api.GET("/notification", handleGetNotification)
+		api.POST("/notification", handleUpdateNotification)
 
 		// Token 统计
 		api.GET("/stats", handleGetStats)
@@ -1537,6 +1753,9 @@ func handleOpenAIChat(c *gin.Context) {
 	// 转换消息格式
 	messages := convertToKiroMessages(req.Messages)
 
+	// 检查本 session 是否需要注入通知（历史消息中已有则跳过）
+	c.Set("inject_notification", shouldInjectNotification(req.Messages))
+
 	if req.Stream {
 		handleStreamResponse(c, messages, "openai", req.Model)
 	} else {
@@ -1638,6 +1857,9 @@ func handleClaudeChat(c *gin.Context) {
 	// 转换消息格式（支持 system、tools、tool_use、tool_result）
 	messages, tools, toolResults, toolNameMap := convertToKiroMessagesWithSystem(req.Messages, req.System, req.Tools)
 
+	// 检查本 session 是否需要注入通知（历史消息中已有则跳过）
+	c.Set("inject_notification", shouldInjectNotification(req.Messages))
+
 	if req.Stream {
 		handleStreamResponseWithTools(c, messages, tools, toolResults, "claude", req.Model, toolNameMap)
 	} else {
@@ -1649,6 +1871,10 @@ func handleClaudeChat(c *gin.Context) {
 func convertToKiroMessages(messages []map[string]any) []kiroclient.ChatMessage {
 	var kiroMessages []kiroclient.ChatMessage
 
+	// 获取当前通知内容（用于从历史消息中过滤）
+	// 只有通知开启时才需要过滤，关闭时不干预历史消息
+	notifEnabled, notificationMsg := getNotificationMessage()
+
 	for _, msg := range messages {
 		role, _ := msg["role"].(string)
 
@@ -1659,6 +1885,10 @@ func convertToKiroMessages(messages []map[string]any) []kiroclient.ChatMessage {
 		case string:
 			// 简单字符串格式
 			content = v
+			// 从 assistant 消息中过滤通知内容（仅通知开启时）
+			if role == "assistant" && notifEnabled && notificationMsg != "" {
+				content = stripNotificationFromContent(content, notificationMsg)
+			}
 		case []interface{}:
 			// 数组格式（OpenAI/Claude 多模态）
 			for _, item := range v {
@@ -1673,6 +1903,10 @@ func convertToKiroMessages(messages []map[string]any) []kiroclient.ChatMessage {
 				case "text":
 					// 文本内容
 					if text, ok := m["text"].(string); ok {
+						// 从 assistant 消息中过滤通知内容（仅通知开启时）
+						if role == "assistant" && notifEnabled && notificationMsg != "" {
+							text = stripNotificationFromContent(text, notificationMsg)
+						}
 						content += text
 					}
 
@@ -1758,6 +1992,10 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 	// 转换 tools（返回工具名映射表）
 	kiroTools, toolNameMap = convertClaudeTools(tools)
 
+	// 获取当前通知内容（用于从历史消息中过滤）
+	// 只有通知开启时才需要过滤，关闭时不干预历史消息
+	notifEnabled2, notificationMsg := getNotificationMessage()
+
 	for _, msg := range messages {
 		role, _ := msg["role"].(string)
 
@@ -1769,6 +2007,10 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 		switch v := msg["content"].(type) {
 		case string:
 			content = v
+			// 从 assistant 消息中过滤通知内容（仅通知开启时）
+			if role == "assistant" && notifEnabled2 && notificationMsg != "" {
+				content = stripNotificationFromContent(content, notificationMsg)
+			}
 		case []interface{}:
 			for _, item := range v {
 				m, ok := item.(map[string]interface{})
@@ -1781,6 +2023,10 @@ func convertToKiroMessagesWithSystem(messages []map[string]any, system any, tool
 				switch itemType {
 				case "text":
 					if text, ok := m["text"].(string); ok {
+						// 从 assistant 消息中过滤通知内容（仅通知开启时）
+						if role == "assistant" && notifEnabled2 && notificationMsg != "" {
+							text = stripNotificationFromContent(text, notificationMsg)
+						}
 						content += text
 					}
 
@@ -2312,6 +2558,52 @@ func handleStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, for
 			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
 			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
+			// 在流式结束前注入系统通知（所有格式通用）
+			// 从 gin.Context 读取是否需要注入（一个 session 只注入一次）
+			injectNotif, _ := c.Get("inject_notification")
+			shouldInject, _ := injectNotif.(bool)
+			enabled, notifMsg := getNotificationMessage()
+			if shouldInject && enabled && notifMsg != "" {
+				noticeText := wrapNotification(notifMsg)
+				if format == "openai" {
+					// OpenAI 格式：发送一个带通知文本的 delta chunk
+					noticeChunk := map[string]any{
+						"id":                 chatcmplID,
+						"object":             "chat.completion.chunk",
+						"created":            time.Now().Unix(),
+						"model":              model,
+						"system_fingerprint": nil,
+						"choices": []map[string]any{
+							{
+								"index": 0,
+								"delta": map[string]any{
+									"content": noticeText,
+								},
+								"logprobs":      nil,
+								"finish_reason": nil,
+							},
+						},
+					}
+					ndata, _ := json.Marshal(noticeChunk)
+					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(ndata))
+					flusher.Flush()
+				} else {
+					// Claude 格式：发送 content_block_delta
+					claudeEnsureBlock("text")
+					noticeDelta := map[string]any{
+						"type":  "content_block_delta",
+						"index": claudeBlockIndex,
+						"delta": map[string]string{
+							"type": "text_delta",
+							"text": noticeText,
+						},
+					}
+					ndata, _ := json.Marshal(noticeDelta)
+					_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(ndata))
+					flusher.Flush()
+				}
+			}
+
 			if format == "openai" {
 				// OpenAI 流式结束前发送带 usage 的 chunk（使用估算值）
 				stopReason := "stop"
@@ -2482,6 +2774,14 @@ func handleNonStreamResponse(c *gin.Context, messages []kiroclient.ChatMessage, 
 
 	response := responseBuilder.String()
 	thinkingContent := thinkingBuilder.String()
+
+	// 非流式响应也注入系统通知（一个 session 只注入一次）
+	injectNotif, _ := c.Get("inject_notification")
+	shouldInject, _ := injectNotif.(bool)
+	enabled, notifMsg := getNotificationMessage()
+	if shouldInject && enabled && notifMsg != "" {
+		response += wrapNotification(notifMsg)
+	}
 
 	// 记录账号请求成功
 	accountID, email := client.Auth.GetLastSelectedAccountInfo()
@@ -2750,6 +3050,31 @@ func handleStreamResponseWithTools(c *gin.Context, messages []kiroclient.ChatMes
 			// 使用本地估算值发送 SSE 事件（因为此时 usage 还未返回）
 			estimatedOutputTokens = kiroclient.CountTokens(outputBuilder.String())
 
+			// 在关闭文本块之前注入通知，追加到同一个 content_block
+			// 只在最终响应（end_turn）时注入系统通知，tool_use 时不注入
+			injectNotif, _ := c.Get("inject_notification")
+			shouldInject, _ := injectNotif.(bool)
+			enabledNotif, notifMsg := getNotificationMessage()
+			if shouldInject && enabledNotif && notifMsg != "" {
+				// 如果文本块还没开始，先开始一个
+				if !claudeBlockStarted || claudeBlockType != "text" {
+					claudeEnsureBlock("text")
+				}
+				// 追加通知到当前文本块
+				noticeText := wrapNotification(notifMsg)
+				noticeDelta := map[string]any{
+					"type":  "content_block_delta",
+					"index": contentBlockIndex,
+					"delta": map[string]string{
+						"type": "text_delta",
+						"text": noticeText,
+					},
+				}
+				ndata, _ := json.Marshal(noticeDelta)
+				_, _ = fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", string(ndata))
+				flusher.Flush()
+			}
+
 			// 关闭当前打开的 content block（可能是 thinking/text）
 			claudeCloseCurrentBlock()
 
@@ -3013,6 +3338,17 @@ func handleNonStreamResponseWithTools(c *gin.Context, messages []kiroclient.Chat
 	}
 
 	// 非流式响应(Tools)完成日志已禁用（减少日志噪音）
+
+	// 非流式 Tools 响应通知注入（仅在没有 tool_use 时注入，即 stop_reason 为 end_turn）
+	if len(toolUses) == 0 {
+		injectNotif, _ := c.Get("inject_notification")
+		shouldInject, _ := injectNotif.(bool)
+		enabled, notifMsg := getNotificationMessage()
+		if shouldInject && enabled && notifMsg != "" {
+			wrapped := wrapNotification(notifMsg)
+			responseText.WriteString(wrapped)
+		}
+	}
 
 	// 构建 content 数组
 	var contentBlocks []map[string]any

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,32 +17,39 @@ import (
 	kiroclient "github.com/jinfeijie/kiro-api-client-go"
 )
 
+// integrationOnce 保证 os.Chdir 和全局初始化只执行一次
+// 多个测试函数各自调用 setupIntegrationTestRouter，如果每次都 Chdir("..") 会导致工作目录越来越远
+var integrationOnce sync.Once
+
 // setupIntegrationTestRouter 创建集成测试路由器
 // 模拟 main() 的初始化流程，确保账号缓存、代理配置、熔断统计器等全局状态就绪
 func setupIntegrationTestRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
-	// go test ./server/ 的工作目录是 kiro-api-client-go/server/
-	// 但配置文件（kiro-accounts.json 等）在 kiro-api-client-go/ 根目录
-	// 需要切换到上级目录，与 main() 的运行环境保持一致
-	os.Chdir("..")
+	// 全局初始化只执行一次，避免多次 Chdir 导致工作目录偏移
+	integrationOnce.Do(func() {
+		// go test ./server/ 的工作目录是 kiro-api-client-go/server/
+		// 但配置文件（kiro-accounts.json 等）在 kiro-api-client-go/ 根目录
+		// 需要切换到上级目录，与 main() 的运行环境保持一致
+		os.Chdir("..")
 
-	client = kiroclient.NewKiroClient()
+		client = kiroclient.NewKiroClient()
 
-	// 初始化账号缓存（从 kiro-accounts.json 加载到内存）
-	// 不初始化会导致 selectAccount() 找不到账号，请求挂起或报错
-	_ = client.Auth.InitAccountsCache()
+		// 初始化账号缓存（从 kiro-accounts.json 加载到内存）
+		// 不初始化会导致 selectAccount() 找不到账号，请求挂起或报错
+		_ = client.Auth.InitAccountsCache()
 
-	// 加载代理配置（thinking 模式等），不加载则使用零值可能导致空指针
-	loadProxyConfig()
+		// 加载代理配置（thinking 模式等），不加载则使用零值可能导致空指针
+		loadProxyConfig()
 
-	// 加载模型映射
-	loadModelMapping()
+		// 加载模型映射
+		loadModelMapping()
 
-	// 初始化熔断错误率统计器（部分 handler 会调用 circuitStats.Record）
-	if circuitStats == nil {
-		circuitStats = NewCircuitStats()
-	}
+		// 初始化熔断错误率统计器（部分 handler 会调用 circuitStats.Record）
+		if circuitStats == nil {
+			circuitStats = NewCircuitStats()
+		}
+	})
 
 	router := gin.New()
 	router.POST("/v1/chat/completions", handleOpenAIChat)

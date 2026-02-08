@@ -429,6 +429,26 @@
                     <div class="text-center text-gray-500 py-4">点击"加载"查看当前黑名单</div>
                 </div>
             </div>
+
+            <!-- 系统通知配置 -->
+            <div class="bg-white rounded-lg shadow-md p-6 mt-6">
+                <h2 class="text-xl font-bold mb-4 text-gray-800"><i class="fas fa-bell text-yellow-500 mr-2"></i>系统通知</h2>
+                <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+                    <p class="text-sm text-yellow-800"><i class="fas fa-info-circle mr-2"></i>启用后，AI 回复末尾会自动追加通知内容（支持 Markdown）。客户端回传时会自动过滤通知，避免 AI 误解。</p>
+                </div>
+                <div class="flex items-center space-x-4 mb-4">
+                    <label class="flex items-center space-x-2">
+                        <input type="checkbox" id="notificationEnabled" class="w-5 h-5 text-yellow-600">
+                        <span class="font-medium">启用通知</span>
+                    </label>
+                    <button onclick="loadNotificationConfig(true)" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition"><i class="fas fa-sync-alt mr-2"></i>加载</button>
+                    <button onclick="saveNotificationConfig()" class="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition"><i class="fas fa-save mr-2"></i>保存</button>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">通知内容（Markdown）</label>
+                    <textarea id="notificationMessage" rows="6" class="w-full px-3 py-2 border border-gray-300 rounded-lg font-mono text-sm" placeholder=">            &#10;### 📣 网站通知&#10;>            &#10;>            在这里输入通知内容..."></textarea>
+                </div>
+            </div>
         </div>
 
         <!-- 熔断管理面板 -->
@@ -508,6 +528,7 @@
             loadRateLimitConfig(); // 自动加载限流配置
             loadIpBlacklist();    // 自动加载 IP 黑名单
             loadModelMapping();   // 自动加载模型映射配置
+            loadNotificationConfig(); // 自动加载通知配置
             
             // 从URL Hash恢复Tab状态
             restoreTabFromHash();
@@ -1358,6 +1379,32 @@
                 currentIpBlacklistHash = data.hash || '';
                 showToast(`黑名单已保存，共 ${data.count} 个 IP`, 'success');
             } catch (e) { showToast('保存失败: ' + e.message, 'error'); }
+        }
+
+        // ========== 系统通知配置 ==========
+        async function loadNotificationConfig(showMsg = false) {
+            try {
+                const resp = await fetch('/api/notification');
+                const data = await resp.json();
+                document.getElementById('notificationEnabled').checked = data.enabled || false;
+                document.getElementById('notificationMessage').value = data.message || '';
+                if (showMsg) showToast('通知配置已加载', 'success');
+            } catch (e) { showToast('加载通知配置失败: ' + e.message, 'error'); }
+        }
+
+        async function saveNotificationConfig() {
+            try {
+                const enabled = document.getElementById('notificationEnabled').checked;
+                const message = document.getElementById('notificationMessage').value;
+                const resp = await fetch('/api/notification', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled, message })
+                });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                showToast('通知配置已保存', 'success');
+            } catch (e) { showToast('保存通知配置失败: ' + e.message, 'error'); }
         }
 
         // ========== 账号统计图表 ==========
