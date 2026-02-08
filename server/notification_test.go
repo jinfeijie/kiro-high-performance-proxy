@@ -223,3 +223,39 @@ func TestNotificationConfig_HashPrecomputed(t *testing.T) {
 		t.Errorf("用预存 hash 对比应该匹配")
 	}
 }
+
+// TestApiKeyAuth_401WithNotification API-KEY 无效时 401 响应附带通知
+func TestApiKeyAuth_401WithNotification(t *testing.T) {
+	// 模拟有通知开启
+	notificationMutex.Lock()
+	notificationConfig = NotificationConfig{
+		Enabled: true,
+		Message: "API-KEY 已更新，请前往网站获取",
+		Hash:    notifHash("API-KEY 已更新，请前往网站获取"),
+	}
+	notificationMutex.Unlock()
+
+	enabled, msg, _ := getNotificationMessage()
+	if !enabled {
+		t.Errorf("通知应该是开启状态")
+	}
+	if msg == "" {
+		t.Errorf("通知消息不应为空")
+	}
+}
+
+// TestApiKeyAuth_401WithoutNotification 通知关闭时 401 不附带通知
+func TestApiKeyAuth_401WithoutNotification(t *testing.T) {
+	notificationMutex.Lock()
+	notificationConfig = NotificationConfig{
+		Enabled: false,
+		Message: "任意通知",
+		Hash:    notifHash("任意通知"),
+	}
+	notificationMutex.Unlock()
+
+	enabled, _, _ := getNotificationMessage()
+	if enabled {
+		t.Errorf("通知应该是关闭状态")
+	}
+}

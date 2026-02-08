@@ -39,6 +39,33 @@ func notifHash(msg string) string {
 	return notifHashPrefix + computeHash([]byte(msg)) + notifHashSuffix
 }
 
+// stripMarkdownToPlain 把 Markdown 格式剥成纯文本
+// 用于 401 响应中的 notification 字段，终端/CLI 场景不需要 Markdown 渲染
+func stripMarkdownToPlain(s string) string {
+	// 去掉行首的 > 引用符号
+	lines := strings.Split(s, "\n")
+	var out []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// 去掉 Markdown 引用前缀
+		for strings.HasPrefix(line, ">") {
+			line = strings.TrimPrefix(line, ">")
+			line = strings.TrimSpace(line)
+		}
+		// 去掉 Markdown 标题前缀
+		for strings.HasPrefix(line, "#") {
+			line = strings.TrimPrefix(line, "#")
+		}
+		line = strings.TrimSpace(line)
+		// 去掉反引号
+		line = strings.ReplaceAll(line, "`", "")
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
 // formatNotificationBlock 格式化通知文本（用于 Claude 独立 content block 和 OpenAI 文本拼接）
 // hashTag 由调用方传入（保存时预算好的），运行时不重复计算
 func formatNotificationBlock(msg string, hashTag string) string {
@@ -908,9 +935,13 @@ func stripNotificationFromText(content string, hashTag string) string {
 
 // shouldInjectNotification 检查是否应该注入通知
 // 用预存的 hash 做对比，不重算 MD5
+// 历史消息中已有通知则跳过（一个 session 只注入一次）
 func shouldInjectNotification(messages []map[string]any) bool {
-	enabled, _, hashTag := getNotificationMessage()
-	if !enabled || hashTag == "" {
+	notificationMutex.RLock()
+	cfg := notificationConfig
+	notificationMutex.RUnlock()
+
+	if !cfg.Enabled || cfg.Hash == "" {
 		return false
 	}
 
@@ -922,7 +953,7 @@ func shouldInjectNotification(messages []map[string]any) bool {
 		switch v := m["content"].(type) {
 		case string:
 			// OpenAI 格式：content 是字符串
-			if isNotificationText(v, hashTag) {
+			if isNotificationText(v, cfg.Hash) {
 				return false
 			}
 		case []interface{}:
@@ -930,7 +961,7 @@ func shouldInjectNotification(messages []map[string]any) bool {
 			for _, item := range v {
 				if block, ok := item.(map[string]interface{}); ok {
 					if text, ok := block["text"].(string); ok {
-						if isNotificationText(text, hashTag) {
+						if isNotificationText(text, cfg.Hash) {
 							return false
 						}
 					}
@@ -1124,6 +1155,7 @@ func handleUpdateLogLevel(c *gin.Context) {
 // 支持两种格式：
 // 1. Claude 格式: X-API-Key: sk-xxx
 // 2. OpenAI 格式: Authorization: Bearer sk-xxx
+// API-KEY 无效时返回 401，如果有系统通知则附带通知消息（每次 401 都带）
 func apiKeyAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 如果没有配置 API-KEY，跳过验证
@@ -1148,10 +1180,15 @@ func apiKeyAuthMiddleware() gin.HandlerFunc {
 
 		// 验证 API-KEY
 		if apiKey == "" {
-			errorJSONWithMsgId(c, 401, map[string]any{
+			resp := gin.H{"error": map[string]any{
 				"message": "Missing API key",
 				"type":    "authentication_error",
-			})
+			}, "msgId": GetMsgID(c)}
+			// 附带系统通知（无效 KEY 每次都带，纯文本格式）
+			if enabled, msg, _ := getNotificationMessage(); enabled && msg != "" {
+				resp["notification"] = stripMarkdownToPlain(msg)
+			}
+			c.JSON(401, resp)
 			c.Abort()
 			return
 		}
@@ -1166,10 +1203,15 @@ func apiKeyAuthMiddleware() gin.HandlerFunc {
 		}
 
 		if !valid {
-			errorJSONWithMsgId(c, 401, map[string]any{
+			resp := gin.H{"error": map[string]any{
 				"message": "Invalid API key",
 				"type":    "authentication_error",
-			})
+			}, "msgId": GetMsgID(c)}
+			// 附带系统通知（无效 KEY 每次都带，纯文本格式）
+			if enabled, msg, _ := getNotificationMessage(); enabled && msg != "" {
+				resp["notification"] = stripMarkdownToPlain(msg)
+			}
+			c.JSON(401, resp)
 			c.Abort()
 			return
 		}
