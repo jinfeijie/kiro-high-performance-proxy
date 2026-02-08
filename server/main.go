@@ -109,7 +109,6 @@ type ClaudeContentBlock struct {
 // Token 配置请求
 type TokenConfigRequest struct {
 	AccessToken string `json:"accessToken"`
-	TokenPath   string `json:"tokenPath"`
 }
 
 // Token 状态响应
@@ -120,6 +119,8 @@ type TokenStatusResponse struct {
 	ExpiresAt string `json:"expiresAt"`
 	IsExpired bool   `json:"isExpired"`
 	Error     string `json:"error,omitempty"`
+	// 账号信息
+	Email string `json:"email"`
 	// 额度信息
 	UsedCredits      float64 `json:"usedCredits"`
 	TotalCredits     float64 `json:"totalCredits"`
@@ -1241,9 +1242,20 @@ func main() {
 	_ = r.Run(":" + port)
 }
 
-// handleTokenStatus 获取 Token 状态
+// handleTokenStatus 获取 Token 状态（从多账号中获取当前账号信息）
 func handleTokenStatus(c *gin.Context) {
-	token, err := client.Auth.ReadToken()
+	// 从多账号中选择当前账号
+	accountID, email := client.Auth.GetLastSelectedAccountInfo()
+	if accountID == "" {
+		c.JSON(200, TokenStatusResponse{
+			Valid: false,
+			Error: "没有可用账号",
+		})
+		return
+	}
+
+	// 获取账号配置
+	config, err := client.Auth.LoadAccountsConfig()
 	if err != nil {
 		c.JSON(200, TokenStatusResponse{
 			Valid: false,
@@ -1252,17 +1264,35 @@ func handleTokenStatus(c *gin.Context) {
 		return
 	}
 
+	// 查找当前账号的 Token
+	var currentToken *kiroclient.KiroAuthToken
+	for _, acc := range config.Accounts {
+		if acc.ID == accountID && acc.Token != nil {
+			currentToken = acc.Token
+			break
+		}
+	}
+
+	if currentToken == nil {
+		c.JSON(200, TokenStatusResponse{
+			Valid: false,
+			Error: "当前账号 Token 为空",
+		})
+		return
+	}
+
 	resp := TokenStatusResponse{
 		Valid:     true,
-		Region:    token.Region,
-		Provider:  token.Provider,
-		ExpiresAt: token.ExpiresAt,
-		IsExpired: token.IsExpired(),
+		Region:    currentToken.Region,
+		Provider:  currentToken.Provider,
+		ExpiresAt: currentToken.ExpiresAt,
+		IsExpired: currentToken.IsExpired(),
 	}
 
 	// 生成完整的 token JSON 数据
-	tokenBytes, _ := json.MarshalIndent(token, "", "  ")
+	tokenBytes, _ := json.MarshalIndent(currentToken, "", "  ")
 	resp.TokenData = string(tokenBytes)
+	resp.Email = email
 
 	// 获取额度信息
 	usage, err := client.Auth.GetUsageLimits()
@@ -1303,7 +1333,7 @@ func handleTokenStatus(c *gin.Context) {
 	c.JSON(200, resp)
 }
 
-// handleTokenConfig 配置 Token
+// handleTokenConfig 配置 Token（重新加载账号缓存）
 func handleTokenConfig(c *gin.Context) {
 	var req TokenConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1316,13 +1346,11 @@ func handleTokenConfig(c *gin.Context) {
 		_ = os.Setenv("KIRO_ACCESS_TOKEN", req.AccessToken)
 	}
 
-	// 如果提供了 TokenPath，设置环境变量
-	if req.TokenPath != "" {
-		_ = os.Setenv("KIRO_AUTH_TOKEN_PATH", req.TokenPath)
+	// 强制从文件重新加载账号缓存（InitAccountsCache 有 accountsLoaded 守卫会跳过）
+	if _, err := client.Auth.LoadAccountsConfigFromFile(); err != nil {
+		c.JSON(500, gin.H{"error": "重新加载账号配置失败: " + err.Error()})
+		return
 	}
-
-	// 重新初始化客户端（清除旧 token 缓存，但保留保活和账号缓存）
-	client.Auth.ClearTokenCache()
 
 	c.JSON(200, gin.H{"message": "Token 配置成功"})
 }

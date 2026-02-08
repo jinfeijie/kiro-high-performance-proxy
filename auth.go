@@ -18,10 +18,6 @@ import (
 
 // AuthManager Token 管理器
 type AuthManager struct {
-	tokenPath      string
-	clientRegPath  string
-	token          *KiroAuthToken
-	clientReg      *ClientRegistration
 	cachedModels   []Model   // 缓存的模型列表
 	modelsLoadedAt time.Time // 模型列表加载时间
 	mu             sync.RWMutex
@@ -54,11 +50,7 @@ type AuthManager struct {
 
 // NewAuthManager 创建 AuthManager
 func NewAuthManager() *AuthManager {
-	homeDir, _ := os.UserHomeDir()
-	cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-
 	return &AuthManager{
-		tokenPath:       filepath.Join(cacheDir, "kiro-auth-token.json"),
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		circuitBreakers: make(map[string]*CircuitBreaker),
 		circuitConfig:   DefaultCircuitBreakerConfig,
@@ -453,193 +445,17 @@ func (m *AuthManager) selectAccount() (*AccountInfo, error) {
 	return selected.account, nil
 }
 
-// ReadToken 读取 Token
-func (m *AuthManager) ReadToken() (*KiroAuthToken, error) {
-	m.mu.RLock()
-	if m.token != nil {
-		defer m.mu.RUnlock()
-		return m.token, nil
-	}
-	m.mu.RUnlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	data, err := os.ReadFile(m.tokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("读取 token 文件失败: %w", err)
-	}
-
-	var token KiroAuthToken
-	if err := json.Unmarshal(data, &token); err != nil {
-		return nil, fmt.Errorf("解析 token 失败: %w", err)
-	}
-
-	m.token = &token
-
-	// 设置 clientRegPath
-	if token.ClientIDHash != "" {
-		homeDir, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-		m.clientRegPath = filepath.Join(cacheDir, token.ClientIDHash+".json")
-	}
-
-	return &token, nil
-}
-
-// ReadClientRegistration 读取客户端注册信息
-func (m *AuthManager) ReadClientRegistration() (*ClientRegistration, error) {
-	m.mu.RLock()
-	if m.clientReg != nil {
-		defer m.mu.RUnlock()
-		return m.clientReg, nil
-	}
-	m.mu.RUnlock()
-
-	if m.clientRegPath == "" {
-		token, err := m.ReadToken()
-		if err != nil {
-			return nil, err
-		}
-		homeDir, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-		m.clientRegPath = filepath.Join(cacheDir, token.ClientIDHash+".json")
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	data, err := os.ReadFile(m.clientRegPath)
-	if err != nil {
-		return nil, fmt.Errorf("读取客户端注册文件失败: %w", err)
-	}
-
-	var reg ClientRegistration
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return nil, fmt.Errorf("解析客户端注册信息失败: %w", err)
-	}
-
-	m.clientReg = &reg
-	return &reg, nil
-}
-
-// RefreshToken 刷新 Token
-func (m *AuthManager) RefreshToken() error {
-	token, err := m.ReadToken()
-	if err != nil {
-		return err
-	}
-
-	clientReg, err := m.ReadClientRegistration()
-	if err != nil {
-		return err
-	}
-
-	// 构建刷新请求
-	reqBody := TokenRefreshRequest{
-		ClientID:     clientReg.ClientID,
-		ClientSecret: clientReg.ClientSecret,
-		GrantType:    "refresh_token",
-		RefreshToken: token.RefreshToken,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("序列化请求失败: %w", err)
-	}
-
-	// 确定 OIDC endpoint
-	region := token.Region
-	if region == "" {
-		region = "us-east-1"
-	}
-	url := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("发送请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("刷新 token 失败 [%d]: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var refreshResp TokenRefreshResponse
-	if err := json.NewDecoder(resp.Body).Decode(&refreshResp); err != nil {
-		return fmt.Errorf("解析响应失败: %w", err)
-	}
-
-	// 更新 token
-	m.mu.Lock()
-	token.AccessToken = refreshResp.AccessToken
-	token.RefreshToken = refreshResp.RefreshToken
-	expiresAt := time.Now().Add(time.Duration(refreshResp.ExpiresIn) * time.Second)
-	token.ExpiresAt = expiresAt.Format(time.RFC3339)
-	m.token = token
-	m.mu.Unlock()
-
-	// 保存到文件
-	return m.SaveToken(token)
-}
-
-// SaveToken 保存 Token
-func (m *AuthManager) SaveToken(token *KiroAuthToken) error {
-	data, err := json.MarshalIndent(token, "", "  ")
-	if err != nil {
-		return fmt.Errorf("序列化 token 失败: %w", err)
-	}
-
-	if err := os.WriteFile(m.tokenPath, data, 0600); err != nil {
-		return fmt.Errorf("保存 token 失败: %w", err)
-	}
-
-	return nil
-}
-
-// ClearTokenCache 清除内存中的 token 和 clientReg 缓存
-// 用于 token 配置变更后强制重新加载，而不需要重建整个 client
-func (m *AuthManager) ClearTokenCache() {
-	m.mu.Lock()
-	m.token = nil
-	m.clientReg = nil
-	m.mu.Unlock()
-}
-
 // GetAccessToken 获取有效的 Access Token（加权轮询选择账号）
 func (m *AuthManager) GetAccessToken() (string, error) {
-	// 优先使用多账号轮询
+	// 多账号加权轮询
 	account, err := m.selectAccount()
-	if err == nil && account != nil && account.Token != nil {
-		return account.Token.AccessToken, nil
-	}
-
-	// 降级：使用旧的单 Token 逻辑
-	token, err := m.ReadToken()
 	if err != nil {
 		return "", err
 	}
-
-	// 检查是否过期
-	if token.IsExpired() {
-		if err := m.RefreshToken(); err != nil {
-			return "", fmt.Errorf("刷新 token 失败: %w", err)
-		}
-		token, err = m.ReadToken()
-		if err != nil {
-			return "", err
-		}
+	if account == nil || account.Token == nil {
+		return "", fmt.Errorf("没有可用账号")
 	}
-
-	return token.AccessToken, nil
+	return account.Token.AccessToken, nil
 }
 
 // GetAccessTokenWithAccountID 获取指定账号的 Token（用于需要追踪账号的场景）
@@ -723,14 +539,15 @@ func (m *AuthManager) RecordRequestResult(accountID string, success bool) {
 
 // GetRegion 获取区域
 func (m *AuthManager) GetRegion() string {
-	token, err := m.ReadToken()
-	if err != nil {
+	// 从多账号中获取 region，不再依赖旧的单 Token 文件
+	account, err := m.selectAccount()
+	if err != nil || account == nil || account.Token == nil {
 		return "us-east-1"
 	}
-	if token.Region == "" {
+	if account.Token.Region == "" {
 		return "us-east-1"
 	}
-	return token.Region
+	return account.Token.Region
 }
 
 // ListAvailableModels 调用 Kiro API 获取账号可用的模型列表
@@ -1109,58 +926,17 @@ func (m *AuthManager) LoadAccountsConfig() (*AccountsConfig, error) {
 	config, err := m.loadAccountsFromFile()
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 配置文件不存在，检查是否有现有 Token
 			config = &AccountsConfig{Accounts: []AccountInfo{}}
-			m.migrateExistingToken(config)
-			// 更新缓存
 			m.updateCache(config)
 			return config, nil
 		}
 		return nil, fmt.Errorf("读取账号配置失败: %w", err)
 	}
 
-	// 如果账号列表为空但有 Token，自动迁移
-	if len(config.Accounts) == 0 {
-		m.migrateExistingToken(config)
-	}
-
 	// 更新缓存
 	m.updateCache(config)
 
 	return config, nil
-}
-
-// migrateExistingToken 将现有 Token 迁移为第一个账号
-func (m *AuthManager) migrateExistingToken(config *AccountsConfig) {
-	token, err := m.ReadToken()
-	if err != nil || token == nil {
-		return
-	}
-
-	// 读取客户端注册信息
-	clientReg, _ := m.ReadClientRegistration()
-
-	// 生成账号 ID
-	h := sha256.New()
-	h.Write([]byte(token.ClientIDHash))
-	accountID := hex.EncodeToString(h.Sum(nil))[:16]
-
-	account := AccountInfo{
-		ID:         accountID,
-		Token:      token,
-		CreatedAt:  time.Now().Format(time.RFC3339),
-		LastUsedAt: time.Now().Format(time.RFC3339),
-	}
-
-	if clientReg != nil {
-		account.ClientID = clientReg.ClientID
-		account.ClientSecret = clientReg.ClientSecret
-	}
-
-	config.Accounts = append(config.Accounts, account)
-
-	// 保存配置
-	m.SaveAccountsConfig(config)
 }
 
 // SaveAccountsConfig 保存多账号配置（同时更新缓存和文件）
@@ -1439,7 +1215,7 @@ func (m *AuthManager) CompleteLogin(session *LoginSession) (*AccountInfo, error)
 	// 生成账号 ID
 	accountID := session.SessionID
 
-	// 创建账号信息
+	// 创建账号信息（clientID/clientSecret 直接存在 AccountInfo 中，不再写 sso cache）
 	account := &AccountInfo{
 		ID:           accountID,
 		DeviceCode:   session.DeviceCode,
@@ -1450,29 +1226,6 @@ func (m *AuthManager) CompleteLogin(session *LoginSession) (*AccountInfo, error)
 		CreatedAt:    time.Now().Format(time.RFC3339),
 		LastUsedAt:   time.Now().Format(time.RFC3339),
 	}
-
-	// 保存客户端注册信息到标准位置（兼容 Kiro IDE）
-	homeDir, _ := os.UserHomeDir()
-	cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-	clientRegPath := filepath.Join(cacheDir, clientIDHash+".json")
-
-	clientReg := &ClientRegistration{
-		ClientID:     session.ClientID,
-		ClientSecret: session.ClientSecret,
-	}
-	clientRegData, _ := json.MarshalIndent(clientReg, "", "  ")
-	os.WriteFile(clientRegPath, clientRegData, 0600)
-
-	// 先保存 Token 到标准路径，以便 GetUsageLimits 可以使用
-	if err := m.SaveToken(token); err != nil {
-		return nil, fmt.Errorf("保存 Token 失败: %w", err)
-	}
-
-	// 清除缓存，强制使用新 Token
-	m.mu.Lock()
-	m.token = nil
-	m.clientReg = nil
-	m.mu.Unlock()
 
 	// 获取 profileArn（登录后自动获取）
 	profileArn, err := m.ListAvailableProfiles(token.AccessToken, session.Region)
@@ -1560,18 +1313,6 @@ func (m *AuthManager) SwitchAccount(accountID string) error {
 	// 保存配置
 	if err := m.SaveAccountsConfig(config); err != nil {
 		return fmt.Errorf("保存账号配置失败: %w", err)
-	}
-
-	// 将该账号的 Token 设置为当前 Token
-	if targetAccount.Token != nil {
-		if err := m.SaveToken(targetAccount.Token); err != nil {
-			return fmt.Errorf("保存 Token 失败: %w", err)
-		}
-		// 清除缓存，强制重新加载
-		m.mu.Lock()
-		m.token = nil
-		m.clientReg = nil
-		m.mu.Unlock()
 	}
 
 	return nil
@@ -1833,7 +1574,7 @@ func (m *AuthManager) ImportAccount(tokenJSON, clientRegJSON string) (*AccountIn
 		accountID = hex.EncodeToString(h.Sum(nil))[:16]
 	}
 
-	// 创建账号信息
+	// 创建账号信息（clientID/clientSecret 直接存在 AccountInfo 中，不再写 sso cache）
 	account := &AccountInfo{
 		ID:           accountID,
 		Token:        &token,
@@ -1841,19 +1582,6 @@ func (m *AuthManager) ImportAccount(tokenJSON, clientRegJSON string) (*AccountIn
 		ClientSecret: clientSecret,
 		CreatedAt:    time.Now().Format(time.RFC3339),
 		LastUsedAt:   time.Now().Format(time.RFC3339),
-	}
-
-	// 如果有 clientIdHash 和 clientReg，保存到标准位置
-	if token.ClientIDHash != "" && clientID != "" && clientSecret != "" {
-		homeDir, _ := os.UserHomeDir()
-		cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-		os.MkdirAll(cacheDir, 0700)
-		clientRegPath := filepath.Join(cacheDir, token.ClientIDHash+".json")
-		clientRegData, _ := json.MarshalIndent(&ClientRegistration{
-			ClientID:     clientID,
-			ClientSecret: clientSecret,
-		}, "", "  ")
-		os.WriteFile(clientRegPath, clientRegData, 0600)
 	}
 
 	// 获取 profileArn（导入时自动获取）
